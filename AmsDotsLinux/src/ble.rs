@@ -8,41 +8,133 @@
 //! goes back to scanning, so the overlay can simply stay running in the
 //! background. `ams-dots-linux disconnect` pauses it, `connect` resumes.
 //!
+//! Finding the phone: the phone advertises the AmsDots service UUID with a
+//! random address that changes whenever its link is (re)started, and BlueZ
+//! keeps old sightings in a cache. A device only counts if it has a signal
+//! strength: BlueZ clears that when a scan stops, so cached sightings from an
+//! earlier scan do not. The chosen phone is recognised by its Bluetooth name.
+//!
 //! Feedback: every change of the link is printed on stderr and shown as a
 //! desktop notification (`notify-send`, if installed), so you see that the two
 //! apps found each other without looking at a terminal.
 
 use crate::control;
 use crate::motion::{LinkState, Live};
+use crate::picker::{Candidate, Target};
 use crate::protocol::{self, CONTROL_UUID, MOTION_UUID, SERVICE_UUID};
-use bluer::{Adapter, AdapterEvent, Device, DeviceEvent, DeviceProperty, DiscoveryFilter, DiscoveryTransport, Uuid, gatt::remote::Characteristic};
+use bluer::{Adapter, Device, DeviceEvent, DeviceProperty, DiscoveryFilter, DiscoveryTransport, Uuid, gatt::remote::Characteristic};
 use futures::{StreamExt, pin_mut};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::{interval, sleep, timeout};
 
-/// Pause before looking for the phone again after a failure or a lost link. Short: the phone is
-/// usually back within a second (the app restarts its advertising at once).
+/// Pause before looking for the phone again after a failure or a lost link.
 const RETRY_DELAY: Duration = Duration::from_millis(500);
+/// How often the list of sightings is looked at while searching.
+const POLL: Duration = Duration::from_millis(250);
 /// Safety net for noticing a dead link when BlueZ sends no event for it.
 const LINK_CHECK: Duration = Duration::from_secs(1);
 /// Connecting normally takes about a second; give up after this.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(12);
 /// Subscribed but silent this long: probably the phone could not negotiate a big enough MTU.
 const SILENCE_HINT: Duration = Duration::from_secs(8);
 
+fn service_uuid() -> Uuid {
+    Uuid::parse_str(SERVICE_UUID).expect("valid service UUID")
+}
+
 /// Starts the receiver thread. `rate_hz`, if given, is sent to the phone after each connect.
-pub fn spawn(live: Arc<Live>, rate_hz: Option<u8>) {
+pub fn spawn(live: Arc<Live>, rate_hz: Option<u8>, target: Target) {
     std::thread::Builder::new()
         .name("ams-dots-ble".into())
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("async runtime");
             runtime.block_on(async {
-                tokio::join!(connection_loop(live.clone(), rate_hz), control::serve(live));
+                tokio::join!(connection_loop(live.clone(), rate_hz, target), control::serve(live));
             });
         })
         .expect("spawn the Bluetooth thread");
+}
+
+/// Scans for `window` and returns the phones running the AmsDots app, strongest signal first.
+/// Blocking; for the start-up picker.
+pub fn scan(window: Duration) -> Result<Vec<Candidate>, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+    runtime.block_on(async {
+        let (_session, adapter) = open_adapter().await.map_err(|e| e.to_string())?;
+        let _discovery = adapter.discover_devices().await.map_err(|e| e.to_string())?;
+        let deadline = Instant::now() + window;
+        let mut seen: Vec<Candidate> = Vec::new();
+        while Instant::now() < deadline {
+            sleep(POLL).await;
+            for (_, candidate) in fresh_phones(&adapter).await.map_err(|e| e.to_string())? {
+                match seen.iter_mut().find(|c| c.address == candidate.address) {
+                    Some(known) => *known = candidate,
+                    None => seen.push(candidate),
+                }
+            }
+        }
+        // The same phone can show up under two addresses if its link restarted during the scan: keep the stronger.
+        seen.sort_by_key(|c| std::cmp::Reverse(c.rssi.unwrap_or(i16::MIN)));
+        let mut names = HashSet::new();
+        seen.retain(|c| c.name.is_none() || names.insert(c.name.clone()));
+        Ok(seen)
+    })
+}
+
+/// The adapter, set up for finding phones. No UUID is given to the discovery filter on purpose: with one,
+/// bluetoothd 5.87 crashes (SIGSEGV) as soon as the phone's advertisement matches it, so phones are
+/// recognised here by their service UUID instead. The session must stay alive as long as the adapter is used:
+/// dropping it closes the D-Bus connection.
+async fn open_adapter() -> bluer::Result<(bluer::Session, Adapter)> {
+    let session = bluer::Session::new().await?;
+    let adapter = session.default_adapter().await?;
+    adapter.set_powered(true).await?;
+    adapter
+        .set_discovery_filter(DiscoveryFilter {
+            transport: DiscoveryTransport::Le,
+            ..Default::default()
+        })
+        .await?;
+    Ok((session, adapter))
+}
+
+/// The devices that offer the AmsDots service and have been heard from (they have a signal strength).
+async fn fresh_phones(adapter: &Adapter) -> bluer::Result<Vec<(Device, Candidate)>> {
+    let mut phones = Vec::new();
+    for address in adapter.device_addresses().await? {
+        let device = adapter.device(address)?;
+        if !device.uuids().await?.unwrap_or_default().contains(&service_uuid()) {
+            continue;
+        }
+        // Heard just now (it has a signal strength), or still connected from an earlier run that was killed:
+        // a connected phone no longer advertises, so it would never be heard again.
+        let rssi = device.rssi().await?;
+        if rssi.is_none() && !device.is_connected().await.unwrap_or(false) {
+            continue;
+        }
+        let candidate = Candidate { name: device.name().await?, address: address.to_string(), rssi };
+        phones.push((device, candidate));
+    }
+    Ok(phones)
+}
+
+/// Makes Ctrl+C and SIGTERM disconnect the phone before the process ends. Killing the process while connected
+/// would leave the connection open in BlueZ: the phone then stops advertising and the next run cannot find it.
+pub fn disconnect_on_exit(live: Arc<Live>) {
+    use signal_hook::consts::{SIGINT, SIGTERM};
+    let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGINT, SIGTERM]) else { return };
+    std::thread::spawn(move || {
+        if signals.forever().next().is_some() {
+            live.set_enabled(false);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while live.is_connected() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            std::process::exit(130);
+        }
+    });
 }
 
 /// Prints a message and, if possible, shows it as a desktop notification.
@@ -75,7 +167,7 @@ enum Ended {
 }
 
 /// Connects, streams until the link drops, and starts over, forever.
-async fn connection_loop(live: Arc<Live>, rate_hz: Option<u8>) {
+async fn connection_loop(live: Arc<Live>, rate_hz: Option<u8>, target: Target) {
     let mut last_error = String::new();
     loop {
         if !live.is_enabled() {
@@ -85,7 +177,7 @@ async fn connection_loop(live: Arc<Live>, rate_hz: Option<u8>) {
             }
         }
         live.set_link(LinkState::Scanning);
-        match stream_once(&live, rate_hz).await {
+        match stream_once(&live, rate_hz, &target).await {
             Ok(Ended::Lost) => announce("phone disconnected, looking for it again"),
             Ok(Ended::Switched) => announce("disconnected"),
             Err(err) => {
@@ -103,25 +195,23 @@ async fn connection_loop(live: Arc<Live>, rate_hz: Option<u8>) {
 }
 
 /// One whole session: scan, connect, subscribe, stream. Returns when the link ends.
-async fn stream_once(live: &Live, rate_hz: Option<u8>) -> Result<Ended, Box<dyn std::error::Error>> {
-    let session = bluer::Session::new().await?;
-    let adapter = session.default_adapter().await?;
-    adapter.set_powered(true).await?;
-
-    let service = Uuid::parse_str(SERVICE_UUID)?;
-    let device = tokio::select! {
-        found = find_phone(&adapter, service) => found?,
+async fn stream_once(live: &Live, rate_hz: Option<u8>, target: &Target) -> Result<Ended, Box<dyn std::error::Error>> {
+    let (_session, adapter) = open_adapter().await?;
+    // Scanning stops when this is dropped, which happens once the phone is connected.
+    let discovery = adapter.discover_devices().await?;
+    let (device, candidate) = tokio::select! {
+        found = find_phone(&adapter, target) => found?,
         () = until_disabled(live) => return Ok(Ended::Switched),
     };
     live.set_link(LinkState::Connecting);
-    live.set_phone(device.address().to_string());
-    eprintln!("ams-dots: found the phone ({}), connecting", device.address());
+    live.set_phone(format!("{} ({})", candidate.label(), candidate.address));
+    eprintln!("ams-dots: found {} ({}), connecting", candidate.label(), candidate.address);
 
     let setup = async {
         if !device.is_connected().await? {
             timeout(CONNECT_TIMEOUT, device.connect()).await.map_err(|_| "connecting timed out")??;
         }
-        let (motion, control_char) = find_characteristics(&device, service).await?;
+        let (motion, control_char) = find_characteristics(&device).await?;
         if let (Some(hz), Some(control_char)) = (rate_hz, &control_char) {
             control_char.write(&protocol::set_rate_command(hz)).await?;
             eprintln!("ams-dots: asked the phone for {hz} Hz");
@@ -129,19 +219,28 @@ async fn stream_once(live: &Live, rate_hz: Option<u8>) -> Result<Ended, Box<dyn 
         let notifications = motion.notify().await?;
         Ok::<_, Box<dyn std::error::Error>>(notifications)
     };
-    let notifications = tokio::select! {
-        result = setup => result?,
-        () = until_disabled(live) => {
-            let _ = device.disconnect().await;
+    let setup = tokio::select! {
+        result = setup => Some(result),
+        () = until_disabled(live) => None,
+    };
+    let notifications = match setup {
+        Some(Ok(notifications)) => notifications,
+        Some(Err(err)) => {
+            abandon(&device).await;
+            return Err(err);
+        }
+        None => {
+            abandon(&device).await;
             return Ok(Ended::Switched);
         }
     };
+    drop(discovery);
     pin_mut!(notifications);
     let device_events = device.events().await?;
     pin_mut!(device_events);
 
     live.set_link(LinkState::Connected);
-    announce("phone connected, receiving motion");
+    announce(&format!("{} connected, receiving motion", candidate.label()));
 
     let mut check = interval(LINK_CHECK);
     let (mut packets, mut errors, mut hinted) = (0u64, 0u64, false);
@@ -185,35 +284,33 @@ async fn stream_once(live: &Live, rate_hz: Option<u8>) -> Result<Ended, Box<dyn 
             () = until_disabled(live) => break Ended::Switched,
         }
     };
+    abandon(&device).await;
     live.set_link(LinkState::Scanning);
-    let _ = device.disconnect().await;
     Ok(ended)
 }
 
-/// Waits until a device that offers the AmsDots service shows up.
-async fn find_phone(adapter: &Adapter, service: Uuid) -> bluer::Result<Device> {
-    let filter = DiscoveryFilter {
-        uuids: HashSet::from([service]),
-        transport: DiscoveryTransport::Le,
-        ..Default::default()
-    };
-    adapter.set_discovery_filter(filter).await?;
-    let events = adapter.discover_devices().await?;
-    pin_mut!(events);
-    while let Some(event) = events.next().await {
-        if let AdapterEvent::DeviceAdded(address) = event {
-            let device = adapter.device(address)?;
-            if device.uuids().await?.unwrap_or_default().contains(&service) {
-                return Ok(device);
+/// Ends a connection or a connection attempt cleanly. Without this a timed-out attempt stays open in BlueZ
+/// and the next one fails with "operation in progress".
+/// (Do not "tidy up" with `Adapter::remove_device`: it crashes bluetoothd 5.87.)
+async fn abandon(device: &Device) {
+    let _ = device.disconnect().await;
+}
+
+/// Waits until a phone that matches `target` has been seen.
+async fn find_phone(adapter: &Adapter, target: &Target) -> bluer::Result<(Device, Candidate)> {
+    loop {
+        for (device, candidate) in fresh_phones(adapter).await? {
+            if target.matches(&candidate) {
+                return Ok((device, candidate));
             }
         }
+        sleep(POLL).await;
     }
-    Err(bluer::Error { kind: bluer::ErrorKind::Failed, message: "the Bluetooth scan ended".into() })
 }
 
 /// The motion characteristic (required) and the control characteristic (optional) of the phone's service.
-async fn find_characteristics(device: &Device, service: Uuid) -> Result<(Characteristic, Option<Characteristic>), Box<dyn std::error::Error>> {
-    let (motion_uuid, control_uuid) = (Uuid::parse_str(MOTION_UUID)?, Uuid::parse_str(CONTROL_UUID)?);
+async fn find_characteristics(device: &Device) -> Result<(Characteristic, Option<Characteristic>), Box<dyn std::error::Error>> {
+    let (service, motion_uuid, control_uuid) = (service_uuid(), Uuid::parse_str(MOTION_UUID)?, Uuid::parse_str(CONTROL_UUID)?);
     // BlueZ resolves the services a moment after connecting.
     for _ in 0..30 {
         for gatt_service in device.services().await? {

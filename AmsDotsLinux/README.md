@@ -15,27 +15,79 @@ Bluetooth) lives in `../AmsDotsMobileController`.
 | Spring smoothing of the motion signal | done |
 | TOML configuration | done |
 | Mock motion from a CSV recording | done |
-| Receiving real phone data over Bluetooth, converted to vehicle axes | done (tested against golden vectors; not yet tried with the phone) |
+| Receiving real phone data over Bluetooth, converted to vehicle axes | done, tried on a real phone (13 packets/s, no loss) |
+| Pick the phone from a list at start-up | done |
 | Automatic "forward" direction (learned from driving, no calibration step) | done (simulated drives; not yet tried in a car) |
 | `status`, `connect`, `disconnect` commands, desktop notifications | done |
 
-## Build and run
+## Quick start
+
+`ams-dots-linux` is not installed anywhere yet, so it is not a command until you
+do step 3. All commands below run from this directory (`AmsDotsLinux`).
+
+**1. On the phone** (once; details in `../AmsDotsMobileController/README.md`):
+install the app, open it and press **Start** ("Waiting for the laptop").
+
+**2. On the laptop**, with Bluetooth on (`systemctl status bluetooth`):
+
+```sh
+cargo run --release
+```
+
+The first build takes a minute. The app scans for 4 seconds and lists the phones
+that run the AmsDots app:
+
+```
+  [1] Redmi Note 12 Pro 5G          -60 dBm  6D:1E:7C:C1:40:1C <- Enter
+number or Enter to connect, r = rescan, a = first phone that appears, q = quit:
+```
+
+Type the number (or Enter for the one marked), and the dots start following that
+phone. The choice is remembered (`~/.local/state/ams-dots/phone`), so next time
+Enter is enough. A notification says "connected, receiving motion". Stop with
+Ctrl+C; that also disconnects the phone cleanly.
+
+**3. To watch the link** (second terminal, overlay still running):
+
+```sh
+cargo run --release -- status --watch
+```
+
+One live line: link state, packets per second, loss, age of the newest packet and
+the forward / lateral / yaw values the dots get. Shake the phone to see them move.
+
+**Optional: make it a command.** This puts `ams-dots-linux` in `~/.local/bin`
+(already on your PATH), after which you can drop `cargo run --release --`:
+
+```sh
+cargo install --path . --root ~/.local
+ams-dots-linux                      # overlay with phone picker
+ams-dots-linux status --watch
+ams-dots-linux --help
+```
+
+Without installing, the same binary is `./target/release/ams-dots-linux`.
+
+## Build and run, all variants
 
 Requires a Wayland compositor that supports `wlr-layer-shell` (Hyprland, sway,
 river, ...; GNOME does not).
 
 ```sh
-cargo run                                # follow the phone over Bluetooth (dots rest until it connects)
-cargo run -- --no-phone                  # vehicle at rest: dots shimmer in place
-cargo run -- tests/data/drive.csv        # replay a mock drive (loops every 30 s)
-cargo run -- --config my.toml            # use another config file
-cargo run -- --rate 30                   # ask the phone for 30 Hz (10-100; its default is 50)
-ams-dots-linux status [--watch]          # what the running overlay sees: link, phone, packet rate, live motion
-ams-dots-linux connect | disconnect      # start or stop looking for the phone
-ams-dots-linux relearn                   # forget the learned forward direction (after moving the phone)
-cargo test                               # unit tests (no Wayland needed)
+cargo run --release                      # pick a phone from the list, follow it over Bluetooth
+cargo run --release -- --phone "Redmi Note 12 Pro 5G"   # skip the list (also `--phone any`)
+cargo run --release -- --no-phone        # vehicle at rest: dots shimmer in place
+cargo run --release -- tests/data/drive.csv   # replay a mock drive (loops every 30 s)
+cargo run --release -- --config my.toml  # use another config file
+cargo run --release -- --rate 30         # ask the phone for 30 Hz (10-100; its default is 50)
+cargo run --release -- status [--watch]  # what the running overlay sees
+cargo run --release -- connect | disconnect | relearn   # control the running overlay
+cargo test                               # unit tests (no Wayland, no Bluetooth needed)
 hyprctl layers                           # the overlay shows as namespace "ams-dots", level overlay
 ```
+
+Without a terminal (autostart) there is no list: the phone chosen last time is
+used, or the first one found if none was ever chosen.
 
 Stop with Ctrl+C. Optional Hyprland rule to skip the open/close animation:
 
@@ -92,9 +144,11 @@ The file is read once at startup; restart to apply changes.
 
 ## Phone over Bluetooth
 
-By default the overlay looks for the phone app (`../AmsDotsMobileController`):
-start the app's link on the phone and the laptop finds it by its service UUID,
-connects, subscribes and follows it. No pairing is needed. The receiver never
+The overlay follows the phone app (`../AmsDotsMobileController`): the app
+advertises the AmsDots service, the laptop lists the phones that do (picker, see
+Quick start), connects, subscribes and follows the one you chose. No pairing is
+needed. Phones are told apart by their Bluetooth name, because the phone's
+random Bluetooth address changes every time its link is started. The receiver never
 gives up: if the phone leaves or the link drops, the dots settle (no motion
 means a vehicle at rest) and it scans again. Messages go to stderr. BlueZ must
 be running with a powered adapter (`systemctl status bluetooth`).
@@ -105,11 +159,10 @@ printed on stderr and shown as a desktop notification (`notify-send`), e.g.
 view in one line (link state, packets per second, loss, age of the newest
 packet, and the forward / lateral / yaw values the dots get), so shaking the phone
 shows immediately whether the link is responsive. `disconnect` drops the phone
-and stops scanning, `connect` starts again. The phone side advertises fast (about
-ten times a second) for 30 s after you press Start or the link drops, so the
-laptop typically notices it in well under a second. Motion reaches the dots about
-100 ms after it happens (sensor batching 40 ms, packet wait up to 60 ms, BLE
-connection interval a few tens of ms); the spring then smooths it.
+and stops scanning, `connect` starts again. The phone advertises four times a
+second, so the laptop notices it within a moment. Measured on a real link, the
+newest packet is typically 10-40 ms old when the dots read it, plus up to 60 ms
+of packing on the phone and 40 ms of sensor batching; the spring then smooths it.
 
 **Axes.** The phone sends acceleration and rotation in its own axes plus the
 gravity direction; `fusion.rs` converts them: *up* from gravity, *forward* from
@@ -167,7 +220,8 @@ after conversion to the vehicle's frame.
 | `src/replay.rs` | Reads and plays back the CSV recording. |
 | `src/protocol.rs` | Phone packet decoder (tested against `protocol/vectors.txt`) and control command. |
 | `src/fusion.rs` | Phone axes to vehicle axes, and learning which way is forward. |
-| `src/ble.rs` | BlueZ receiver thread: scan, connect, subscribe, reconnect. |
+| `src/picker.rs` | The start-up list of phones, the remembered choice, matching by name. |
+| `src/ble.rs` | BlueZ receiver thread: scan, connect, subscribe, reconnect, clean disconnect on exit. |
 | `src/control.rs` | Unix socket for `status`, `connect`, `disconnect`, `relearn`. |
 | `src/spring.rs` | The damped spring that smooths the motion. |
 | `src/particles.rs` | The dot generator: spawning, ageing, drift, size over life. No drawing. |
@@ -228,6 +282,20 @@ picture. Terms used in `overlay.rs`:
   startup and when one is plugged in; `output_destroyed` when removed. The
   program keeps one overlay, with its own dots and spring, per output.
 
+## Troubleshooting
+
+- **The list is empty / "scanning for the phone" never ends.** Is the phone app
+  at "Waiting for the laptop"? Is the phone's screen on and Bluetooth on? If
+  `bluetoothctl devices Connected` still lists the phone from an earlier run
+  that was killed with `kill -9`, run `bluetoothctl disconnect <address>`.
+- **BlueZ 5.87 crashes (`bluetoothd` segfault).** It dies when a client asks for
+  discovery filtered by service UUID and a matching device appears. This app
+  therefore filters in its own code. If `journalctl -u bluetooth` still shows
+  `SEGV`, update `bluez` (upstream fixed several crashes after 5.87).
+- **Connected but no motion.** The log says so after 8 s: the Bluetooth link
+  needs an MTU of at least 64 (the phone negotiates 517 normally).
+- Everything the app does is printed on stderr; run it from a terminal.
+
 ## Known limitations
 
 - **CPU use**: about 6 % of one core for the app with two 1080p monitors at
@@ -243,4 +311,4 @@ picture. Terms used in `overlay.rs`:
 - `smithay-client-toolkit`: safe Rust helpers over the Wayland protocol.
 - `tiny-skia`: small CPU 2D renderer used to paint anti-aliased circles.
 - `serde`, `toml`: reading the configuration file.
-- `bluer` (BlueZ over D-Bus, needs `libdbus` headers to build), `tokio`, `futures`: the Bluetooth receiver.
+- `bluer` (BlueZ over D-Bus, needs `libdbus` headers to build), `tokio`, `futures`: the Bluetooth receiver. `signal-hook`: disconnect cleanly on Ctrl+C.

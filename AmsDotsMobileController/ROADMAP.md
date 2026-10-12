@@ -8,8 +8,7 @@ or another app in the foreground.
 ## Design decisions
 
 **Transport: BLE GATT notifications.** The phone is the *peripheral*: it runs a
-GATT server and advertises a custom service named "AmsDots" with the lowest-power
-advertising mode. The laptop is the *central*: it connects and subscribes to the
+GATT server and advertises a custom service (four advertisements a second, its name in the scan response). The laptop is the *central*: it connects and subscribes to the
 *motion* characteristic (notify). A *control* characteristic (write) lets the
 laptop choose the sample rate. No pairing is needed, and no tethering has to be
 switched on by hand. Wire format: [`docs/protocol.md`](docs/protocol.md).

@@ -245,6 +245,10 @@ impl Live {
         }
     }
 
+    pub fn is_connected(&self) -> bool {
+        self.lock().link == LinkState::Connected
+    }
+
     pub fn set_phone(&self, address: String) {
         self.lock().phone = Some(address);
     }

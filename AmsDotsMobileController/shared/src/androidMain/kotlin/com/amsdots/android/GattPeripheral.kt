@@ -41,7 +41,7 @@ interface PeripheralEvents {
  * notifications of the motion characteristic; the control characteristic
  * accepts [ControlCommand]s. The wire format is in `docs/protocol.md`.
  *
- * The advertiser uses the lowest-power mode: the only cost while nobody is
+ * The advertiser runs in balanced mode (four a second): the only cost while nobody is
  * connected. BLE connection parameters are chosen by the central, so the phone
  * cannot (and need not) request a connection priority.
  */
@@ -59,16 +59,6 @@ class GattPeripheral(
     @Volatile private var central: BluetoothDevice? = null
     @Volatile private var subscribed = false
     private var advertising = false
-
-    /** Advertise fast (about 10 times a second) for a while after starting or losing the laptop, then slowly. */
-    private var fastAdvertising = true
-    private val relaxAdvertising = Runnable {
-        fastAdvertising = false
-        if (advertising) {
-            stopAdvertising()
-            startAdvertising()
-        }
-    }
 
     private fun post(block: () -> Unit) {
         handler.post(block)
@@ -98,7 +88,6 @@ class GattPeripheral(
     }
 
     fun stop() {
-        handler.removeCallbacks(relaxAdvertising)
         stopAdvertising()
         central = null
         subscribed = false
@@ -128,23 +117,24 @@ class GattPeripheral(
 
     private fun startAdvertising() {
         if (advertising) return
-        // Waiting is cheap in low-power mode (one advertisement a second) but then the laptop needs up to a
-        // second to notice the phone. Right after the user pressed Start, or the link dropped, they are
-        // waiting for it, so advertise ten times as often for the first FAST_ADVERTISE_MS.
-        handler.removeCallbacks(relaxAdvertising)
-        if (fastAdvertising) handler.postDelayed(relaxAdvertising, FAST_ADVERTISE_MS)
         val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(if (fastAdvertising) AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY else AdvertiseSettings.ADVERTISE_MODE_LOW_POWER)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
+            // Four advertisements a second: the laptop notices the phone within a moment, at a cost that only
+            // matters while waiting. The mode is never changed while advertising, because restarting the
+            // advertiser gives it a new random address and a laptop that is just connecting would lose it.
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
+            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
             .setConnectable(true)
             .setTimeout(0)
             .build()
-        // A 128-bit UUID plus flags nearly fills the 31-byte packet, so no name: the laptop finds the phone by service UUID.
+        // A 128-bit UUID plus flags nearly fills the 31-byte packet, so the phone's Bluetooth name goes into the
+        // scan response (a second packet the laptop asks for). The laptop finds phones by the service UUID and
+        // lists them by name, since the random address changes every time the advertiser starts.
         val data = AdvertiseData.Builder()
             .setIncludeDeviceName(false)
             .addServiceUuid(ParcelUuid(UUID.fromString(Protocol.SERVICE_UUID)))
             .build()
-        advertiser?.startAdvertising(settings, data, advertiseCallback)
+        val scanResponse = AdvertiseData.Builder().setIncludeDeviceName(true).build()
+        advertiser?.startAdvertising(settings, data, scanResponse, advertiseCallback)
     }
 
     private fun stopAdvertising() {
@@ -184,7 +174,6 @@ class GattPeripheral(
                 post {
                     if (wasSubscribed) events.onSubscribed(false)
                     events.onConnected(false)
-                    fastAdvertising = true
                     startAdvertising()
                 }
             }
@@ -247,9 +236,6 @@ class GattPeripheral(
 
     private companion object {
         const val TAG = "AmsDots"
-
-        /** How long to advertise in the fast mode after starting or losing the laptop. */
-        const val FAST_ADVERTISE_MS = 30_000L
 
         /** Client Characteristic Configuration descriptor, the standard switch for notifications. */
         val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")

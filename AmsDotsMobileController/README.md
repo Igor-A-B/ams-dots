@@ -17,6 +17,26 @@ milestone status are in [ROADMAP.md](ROADMAP.md); the wire format is in
 | `androidApp` | The Android application module (manifest, activity). |
 | `protocol/vectors.txt` | Test vectors for the packet format, shared with the Rust receiver. |
 
+## Run it on the phone
+
+```sh
+export PATH=$PATH:$HOME/Android/Sdk/platform-tools
+./gradlew :androidApp:assembleDebug
+adb install -r androidApp/build/outputs/apk/debug/androidApp-debug.apk
+adb shell am start -n com.amsdots/.MainActivity
+```
+
+On the phone: press **Start** and allow the Bluetooth and notification
+permissions it asks for (the first press asks, press Start again after allowing).
+The screen then says "Waiting for the laptop"; start the overlay on the laptop
+(`../AmsDotsLinux/README.md`, Quick start) and pick this phone from its list. The
+screen changes to "Streaming" with the achieved sample rate. **Stop** (or the
+notification's Stop action) ends it. Keep the screen on while testing; on Xiaomi
+phones set the app to "No restrictions" in battery settings and enable Autostart,
+or the system kills the service in the background. The switch "Sensor test" runs
+only the sensors, without Bluetooth (rate and jitter are shown, and logged with
+`adb logcat -s AmsDots`).
+
 ## Commands
 
 ```sh
