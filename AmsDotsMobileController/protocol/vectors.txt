@@ -1,0 +1,62 @@
+# Golden test vectors for the AmsDots motion packet (docs/protocol.md).
+# Written with an independent encoder (Python struct), so they check the Kotlin
+# codec and the Rust codec against the spec rather than against each other.
+#
+# Format: blocks separated by blank lines.
+#   vector: <name>            a valid packet
+#   hex: <bytes>              the packet, hexadecimal, spaces ignored
+#   seq / first_sample_ms     header fields
+#   gravity_mg: x y z         header gravity
+#   sample: ax ay az gx gy gz one line per sample (mm/s^2, mrad/s)
+#
+#   invalid: <name>           a packet that must be rejected
+#   hex: <bytes>
+#   error: <kind>             too_short | bad_version | bad_length | bad_count
+
+vector: one_sample_at_rest
+hex: 01 00 00 00 00 00 00 00 00 00 00 e8 03 00 00 00 00 00 00 00 00 00 00 00 00
+seq: 0
+first_sample_ms: 0
+gravity_mg: 0 0 1000
+sample: 0 0 0 0 0 0
+
+vector: four_samples_braking
+hex: 01 01 02 40 e2 01 00 88 ff 23 00 de 03 24 fa 14 00 dd ff 01 00 fe ff 03 00 cc f7 e2 ff 0f 00 fc ff 05 00 fa ff ac f4 0c 00 00 00 07 00 f8 ff 09 00 1c f3 00 00 f4 ff f6 ff 0b 00 f4 ff
+seq: 513
+first_sample_ms: 123456
+gravity_mg: -120 35 990
+sample: -1500 20 -35 1 -2 3
+sample: -2100 -30 15 -4 5 -6
+sample: -2900 12 0 7 -8 9
+sample: -3300 0 -12 -10 11 -12
+
+vector: extreme_values
+hex: 01 ff ff ff ff ff ff 00 80 ff 7f 00 00 ff 7f 00 80 ff 7f 00 80 ff 7f 00 80
+seq: 65535
+first_sample_ms: 4294967295
+gravity_mg: -32768 32767 0
+sample: 32767 -32768 32767 -32768 32767 -32768
+
+invalid: empty
+hex: 
+error: too_short
+
+invalid: header_only_truncated
+hex: 01 01 00 0a 00 00 00 00 00 00 00 e8
+error: too_short
+
+invalid: no_samples
+hex: 01 01 00 0a 00 00 00 00 00 00 00 e8 03
+error: bad_count
+
+invalid: wrong_version
+hex: 02 01 00 0a 00 00 00 00 00 00 00 e8 03 01 00 02 00 03 00 04 00 05 00 06 00
+error: bad_version
+
+invalid: partial_sample
+hex: 01 01 00 0a 00 00 00 00 00 00 00 e8 03 01 00 02 00 03 00 04 00 05 00 06 00 01 02 03
+error: bad_length
+
+invalid: five_samples
+hex: 01 01 00 0a 00 00 00 00 00 00 00 e8 03 01 00 02 00 03 00 04 00 05 00 06 00 01 00 02 00 03 00 04 00 05 00 06 00 01 00 02 00 03 00 04 00 05 00 06 00 01 00 02 00 03 00 04 00 05 00 06 00 01 00 02 00 03 00 04 00 05 00 06 00
+error: bad_count
