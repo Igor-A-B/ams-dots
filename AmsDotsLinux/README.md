@@ -15,7 +15,8 @@ Bluetooth) lives in `../AmsDotsMobileController`.
 | Spring smoothing of the motion signal | done |
 | TOML configuration | done |
 | Mock motion from a CSV recording | done |
-| Receiving real phone data over Bluetooth | not started |
+| Receiving real phone data over Bluetooth, converted to vehicle axes | done (tested against golden vectors; not yet tried with the phone) |
+| Calibrate command (which way is forward) | done |
 
 ## Build and run
 
@@ -23,9 +24,12 @@ Requires a Wayland compositor that supports `wlr-layer-shell` (Hyprland, sway,
 river, ...; GNOME does not).
 
 ```sh
-cargo run                                # vehicle at rest: dots shimmer in place
+cargo run                                # follow the phone over Bluetooth (dots rest until it connects)
+cargo run -- --no-phone                  # vehicle at rest: dots shimmer in place
 cargo run -- tests/data/drive.csv        # replay a mock drive (loops every 30 s)
 cargo run -- --config my.toml            # use another config file
+cargo run -- --rate 30                   # ask the phone for 30 Hz (10-100; its default is 50)
+ams-dots-linux calibrate                 # tell the running overlay which way is forward (see below)
 cargo test                               # unit tests (no Wayland needed)
 hyprctl layers                           # the overlay shows as namespace "ams-dots", level overlay
 ```
@@ -83,9 +87,37 @@ with its default and meaning:
 
 The file is read once at startup; restart to apply changes.
 
+## Phone over Bluetooth
+
+By default the overlay looks for the phone app (`../AmsDotsMobileController`):
+start the app's link on the phone and the laptop finds it by its service UUID,
+connects, subscribes and follows it. No pairing is needed. The receiver never
+gives up: if the phone leaves or the link drops, the dots settle (no motion
+means a vehicle at rest) and it scans again. Messages go to stderr. BlueZ must
+be running with a powered adapter (`systemctl status bluetooth`).
+
+**Axes.** The phone sends acceleration and rotation in its own axes plus the
+gravity direction; `fusion.rs` converts them: *up* from gravity, *forward* from
+a fixed direction in the phone's frame flattened onto the horizontal plane (so
+tilting the phone changes nothing), *right* = forward x up. Without calibration
+the forward direction is guessed from the pose: the top edge when the phone
+lies flat, the back when it stands upright in a holder.
+
+**Calibrate.** To set the real forward direction, with the phone fixed in the
+vehicle run `ams-dots-linux calibrate` (bind it to a key, e.g. in Hyprland
+`bind = $mod, F9, exec, ams-dots-linux calibrate`), then accelerate gently in a
+straight line. The first clear push (over 1 m/s²) is averaged for 1.5 s and
+becomes "forward"; braking first would invert it. The overlay prints the result
+(`Done`, `TooWeak` or `TimedOut`) on stderr. Calibration is kept while the
+overlay runs, so repeat it if the phone is moved.
+
+**Data flow.** A background thread (`ble.rs`) receives notifications, `protocol.rs`
+decodes them, `fusion.rs` converts them and `motion.rs` keeps the newest sample;
+the overlay reads it once per frame. A packet older than 0.5 s counts as gone.
+
 ## Mock motion data
 
-`tests/data/drive.csv` stands in for the phone until it is connected:
+`tests/data/drive.csv` stands in for the phone for development (and replaces it when given on the command line):
 
 ```
 t,forward,lateral,yaw
@@ -95,22 +127,27 @@ t,forward,lateral,yaw
 (positive = passengers pushed right, as in a left turn); `yaw` is the turning
 speed in rad/s (positive = turning left). The bundled drive has: speeding up
 (1-4 s), braking (8-10 s), a left turn (12-15 s), a right turn (17-20 s) and a
-bumpy road (22-28 s). The same quantities are what the phone data will provide
+bumpy road (22-28 s). The same quantities are what the phone data provides
 after conversion to the vehicle's frame.
 
 ## Code map
 
 | File | Responsibility |
 |---|---|
-| `src/main.rs` | Command line, loads config and recording, starts the overlay. |
+| `src/main.rs` | Command line, chooses the motion source, starts the overlay. |
 | `src/config.rs` | TOML settings, defaults and validation. |
+| `src/motion.rs` | The motion source (rest, recording or phone) and the shared latest phone sample. |
 | `src/replay.rs` | Reads and plays back the CSV recording. |
+| `src/protocol.rs` | Phone packet decoder (tested against `protocol/vectors.txt`) and control command. |
+| `src/fusion.rs` | Phone axes to vehicle axes, and the calibration. |
+| `src/ble.rs` | BlueZ receiver thread: scan, connect, subscribe, reconnect. |
+| `src/control.rs` | Unix socket for `ams-dots-linux calibrate`. |
 | `src/spring.rs` | The damped spring that smooths the motion. |
 | `src/particles.rs` | The dot generator: spawning, ageing, drift, size over life. No drawing. |
 | `src/dots.rs` | Paints a list of dots into an image. No Wayland. |
 | `src/overlay.rs` | All compositor communication: overlay surfaces, buffers, frame timing. |
 
-Data flow per frame: recording (or zeros) -> spring -> intensity and drift ->
+Data flow per frame: motion source (phone, recording or zeros) -> spring -> intensity and drift ->
 particle field -> list of dots -> image -> shared memory -> compositor.
 
 ## How the Wayland part works
@@ -179,3 +216,4 @@ picture. Terms used in `overlay.rs`:
 - `smithay-client-toolkit`: safe Rust helpers over the Wayland protocol.
 - `tiny-skia`: small CPU 2D renderer used to paint anti-aliased circles.
 - `serde`, `toml`: reading the configuration file.
+- `bluer` (BlueZ over D-Bus, needs `libdbus` headers to build), `tokio`, `futures`: the Bluetooth receiver.

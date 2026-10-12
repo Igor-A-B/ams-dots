@@ -18,7 +18,8 @@
 use crate::config::Config;
 use crate::dots::{self, Rect};
 use crate::particles::Field;
-use crate::replay::{self, Sample};
+use crate::motion::MotionSource;
+use crate::replay::Sample;
 use crate::spring::Spring;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData, Region},
@@ -52,9 +53,9 @@ const NAMESPACE: &str = "ams-dots";
 const FRAME_SLACK: f32 = 0.004;
 
 /// Connects to the compositor and shows the dots until the process is killed
-/// or the compositor closes our surfaces. With `motion`, the dots react to the
-/// recording (looping); without it they behave as if the vehicle were at rest.
-pub fn run(config: Config, motion: Option<Vec<Sample>>) -> Result<(), String> {
+/// or the compositor closes our surfaces. The dots react to `motion`: the phone,
+/// a looping recording, or nothing (a vehicle at rest).
+pub fn run(config: Config, motion: MotionSource) -> Result<(), String> {
     let conn: Connection = Connection::connect_to_env().map_err(|e| e.to_string())?;
     let (globals, mut event_queue) = registry_queue_init::<App>(&conn).map_err(|e| e.to_string())?;
     let qh: QueueHandle<App> = event_queue.handle();
@@ -135,8 +136,7 @@ struct App {
     slots_pool_len: usize,
     overlays: Vec<Overlay>,
     config: Config,
-    /// Recording to replay, or `None` for a vehicle at rest.
-    motion: Option<Vec<Sample>>,
+    motion: MotionSource,
     /// Replay clock origin.
     started: Instant,
     exit: bool,
@@ -174,13 +174,9 @@ impl App {
         self.overlays.iter().position(|o| o.layer.wl_surface() == surface)
     }
 
-    /// The vehicle motion right now: the recording at the current time, or
-    /// all zeros when there is no recording.
+    /// The vehicle motion right now, from whichever source is configured.
     fn current_sample(&self) -> Sample {
-        match &self.motion {
-            Some(samples) => replay::at(samples, self.started.elapsed().as_secs_f32()),
-            None => Sample { t: 0.0, forward: 0.0, lateral: 0.0, yaw: 0.0 },
-        }
+        self.motion.at(self.started.elapsed().as_secs_f32())
     }
 
     /// (Re)creates the animation state for overlay `index` at the given size.
