@@ -24,7 +24,7 @@ object Protocol {
     const val MIN_RATE_HZ = 10
     const val MAX_RATE_HZ = 100
 
-    /** GATT service the phone advertises and the laptop looks for. */
+    /** GATT service the phone advertises and the laptop scans for (the phone advertises no name). */
     const val SERVICE_UUID = "5be6e39c-9095-468d-a372-5871e621b58b"
 
     /** Notify characteristic carrying motion packets. */
@@ -32,9 +32,6 @@ object Protocol {
 
     /** Write characteristic carrying control commands. */
     const val CONTROL_UUID = "95978bed-ce1d-404c-932b-25cab3db5b2e"
-
-    /** Name the phone advertises. */
-    const val DEVICE_NAME = "AmsDots"
 
     /** Size in bytes of a packet holding [samples] samples. */
     fun packetSize(samples: Int): Int = HEADER_SIZE + SAMPLE_SIZE * samples

@@ -10,9 +10,9 @@ milestone status are in [ROADMAP.md](ROADMAP.md); the wire format is in
 
 | Path | Contents |
 |---|---|
-| `shared/src/commonMain` | Platform-independent code: `protocol/` (packet codec, control commands) and the Compose UI (`App.kt`). |
-| `shared/src/androidMain` | Android-specific code (sensors, BLE, service; arrives in M2/M3). |
-| `shared/src/commonTest` | Codec unit tests. |
+| `shared/src/commonMain` | Platform-independent code: `protocol/` (packet codec, control commands), `stream/` (sensor fusion, packet pacing, rate meter, link status) and the Compose UI (`App.kt`). |
+| `shared/src/androidMain` | Android-specific code in `android/`: `MotionSensors`, `GattPeripheral` (GATT server + advertiser), `MotionService` (foreground service), `ServiceState`. |
+| `shared/src/commonTest` | Unit tests for the codec and the `stream/` logic. |
 | `shared/src/androidHostTest` | Tests that need the JVM, e.g. `GoldenVectorsTest`, which reads `protocol/vectors.txt`. |
 | `androidApp` | The Android application module (manifest, activity). |
 | `protocol/vectors.txt` | Test vectors for the packet format, shared with the Rust receiver. |

@@ -14,10 +14,12 @@ All numbers are little-endian. "i16" is a signed 16-bit integer.
 | Motion characteristic | `5af2dba6-9864-4524-812f-60c35dcb3ff0` | notify |
 | Control characteristic | `95978bed-ce1d-404c-932b-25cab3db5b2e` | write |
 
-The phone advertises the service UUID and the local name `AmsDots`. The laptop
-connects, enables notifications on the motion characteristic and, optionally,
-writes control commands. The phone only samples its sensors while the laptop is
-subscribed.
+The phone advertises the service UUID (connectable, lowest-power mode) and no
+name: a 128-bit UUID nearly fills the 31-byte advertisement, and a custom name
+would mean renaming the phone's Bluetooth adapter. The laptop finds the phone by
+service UUID, not by name, connects, enables notifications on the motion
+characteristic and, optionally, writes control commands. The phone only samples
+its sensors while the laptop is subscribed. One laptop at a time.
 
 ## Motion packet (one notification)
 
