@@ -1,0 +1,24 @@
+# Example configuration for ams-dots-linux. Every key is optional; the values
+# below are the defaults. Copy this file to ~/.config/ams-dots/config.toml.
+
+[dots]
+size = 7.0                 # maximum dot radius, in pixels
+lifetime = 2.5             # seconds from a dot's birth to its disappearance
+default_amount = 24        # dots alive while the vehicle is at rest
+motion_extra_amount = 40   # extra dots alive at full motion intensity
+fade_in = 20               # % of the lifetime a dot spends growing
+fade_out = 40              # % of the lifetime a dot spends shrinking away
+edge_band = 8              # width of the spawn band at each side, % of screen width
+
+[motion]
+acceleration_full_scale = 4.0   # m/s² of acceleration that counts as full intensity
+rotation_full_scale = 0.5       # rad/s of turning that counts as full intensity
+flow_gain = 60.0                # px/s of dot drift per m/s² of (smoothed) acceleration
+max_speed = 250.0               # drift speed cap, px/s
+
+[spring]
+stiffness = 60.0           # higher = the motion signal is followed more tightly
+damping_ratio = 0.6        # below 1 overshoots slightly, 1 settles without overshoot
+
+[display]
+fps = 30                   # redraws per second
