@@ -12,12 +12,13 @@ mod spring;
 
 use motion::{Live, MotionSource};
 
-const USAGE: &str = "usage: ams-dots-linux [--config FILE] [--rate HZ] [--no-phone] [recording.csv]\n       ams-dots-linux calibrate";
+const USAGE: &str = "usage: ams-dots-linux [--config FILE] [--rate HZ] [--no-phone] [recording.csv]
+       ams-dots-linux status [--watch] | connect | disconnect | relearn   (talk to the running overlay)";
 
 /// The dots follow the phone over Bluetooth by default; a CSV recording replays
 /// instead (for development), and `--no-phone` shows a vehicle at rest. Settings
 /// come from `~/.config/ams-dots/config.toml` unless `--config` names another file.
-/// `ams-dots-linux calibrate` tells a running overlay which way is forward.
+/// The other commands (`status`, `connect`, `disconnect`, `relearn`) talk to a running overlay.
 fn main() {
     if let Err(err) = start() {
         eprintln!("ams-dots: {err}");
@@ -32,8 +33,13 @@ fn start() -> Result<(), String> {
     let mut use_phone = true;
 
     let mut args = std::env::args().skip(1).peekable();
-    if args.peek().map(String::as_str) == Some("calibrate") {
-        println!("{}", control::send("calibrate")?);
+    if let Some(command @ ("status" | "connect" | "disconnect" | "relearn")) = args.peek().map(String::as_str) {
+        let command = command.to_string();
+        args.next();
+        if command == "status" && args.peek().map(String::as_str) == Some("--watch") {
+            return control::watch();
+        }
+        println!("{}", control::send(&command)?);
         return Ok(());
     }
     while let Some(arg) = args.next() {

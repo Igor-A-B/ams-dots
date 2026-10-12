@@ -16,7 +16,8 @@ Bluetooth) lives in `../AmsDotsMobileController`.
 | TOML configuration | done |
 | Mock motion from a CSV recording | done |
 | Receiving real phone data over Bluetooth, converted to vehicle axes | done (tested against golden vectors; not yet tried with the phone) |
-| Calibrate command (which way is forward) | done |
+| Automatic "forward" direction (learned from driving, no calibration step) | done (simulated drives; not yet tried in a car) |
+| `status`, `connect`, `disconnect` commands, desktop notifications | done |
 
 ## Build and run
 
@@ -29,7 +30,9 @@ cargo run -- --no-phone                  # vehicle at rest: dots shimmer in plac
 cargo run -- tests/data/drive.csv        # replay a mock drive (loops every 30 s)
 cargo run -- --config my.toml            # use another config file
 cargo run -- --rate 30                   # ask the phone for 30 Hz (10-100; its default is 50)
-ams-dots-linux calibrate                 # tell the running overlay which way is forward (see below)
+ams-dots-linux status [--watch]          # what the running overlay sees: link, phone, packet rate, live motion
+ams-dots-linux connect | disconnect      # start or stop looking for the phone
+ams-dots-linux relearn                   # forget the learned forward direction (after moving the phone)
 cargo test                               # unit tests (no Wayland needed)
 hyprctl layers                           # the overlay shows as namespace "ams-dots", level overlay
 ```
@@ -96,20 +99,44 @@ gives up: if the phone leaves or the link drops, the dots settle (no motion
 means a vehicle at rest) and it scans again. Messages go to stderr. BlueZ must
 be running with a powered adapter (`systemctl status bluetooth`).
 
+**Interactive.** The overlay tells you what the link is doing: every change is
+printed on stderr and shown as a desktop notification (`notify-send`), e.g.
+"phone connected, receiving motion". `ams-dots-linux status --watch` is a live
+view in one line (link state, packets per second, loss, age of the newest
+packet, and the forward / lateral / yaw values the dots get), so shaking the phone
+shows immediately whether the link is responsive. `disconnect` drops the phone
+and stops scanning, `connect` starts again. The phone side advertises fast (about
+ten times a second) for 30 s after you press Start or the link drops, so the
+laptop typically notices it in well under a second. Motion reaches the dots about
+100 ms after it happens (sensor batching 40 ms, packet wait up to 60 ms, BLE
+connection interval a few tens of ms); the spring then smooths it.
+
 **Axes.** The phone sends acceleration and rotation in its own axes plus the
 gravity direction; `fusion.rs` converts them: *up* from gravity, *forward* from
 a fixed direction in the phone's frame flattened onto the horizontal plane (so
-tilting the phone changes nothing), *right* = forward x up. Without calibration
-the forward direction is guessed from the pose: the top edge when the phone
-lies flat, the back when it stands upright in a holder.
+tilting the phone changes nothing), *right* = forward x up.
 
-**Calibrate.** To set the real forward direction, with the phone fixed in the
-vehicle run `ams-dots-linux calibrate` (bind it to a key, e.g. in Hyprland
-`bind = $mod, F9, exec, ams-dots-linux calibrate`), then accelerate gently in a
-straight line. The first clear push (over 1 m/s²) is averaged for 1.5 s and
-becomes "forward"; braking first would invert it. The overlay prints the result
-(`Done`, `TooWeak` or `TimedOut`) on stderr. Calibration is kept while the
-overlay runs, so repeat it if the phone is moved.
+**Forward is learned, not calibrated.** Cars go forward, so the app works out
+the direction of travel from the motion itself; there is nothing to press. A
+phone has no velocity sensor, so it uses two facts:
+
+1. While going straight (small yaw rate), the horizontal acceleration is mostly
+   speeding up and braking, i.e. along the car. After **more than 5 s** of such
+   movement, if one direction clearly dominates (80 % of the energy), that is
+   the forward/backward axis.
+2. In a turn, the centripetal acceleration points to the inside, so
+   acceleration times yaw rate points to the car's left. Over 3 s of turning this
+   tells the front of the axis from the back (and gives the whole direction if the
+   car has only turned so far).
+
+Until the evidence is there, the direction is a guess from the phone's pose (top
+edge when it lies flat, back when it stands upright in a holder); `status` says
+"guessing ... learning (n of 5 s)". Pothole-sized readings (over 8 m/s²) and
+sensor noise (under 0.25 m/s²) are ignored. The evidence fades over about 90 s,
+so the estimate follows the phone if it is moved in its mount. Only if the front
+end is wrong for a while (e.g. the first drive was in reverse) run `relearn`.
+Limits: a car that has never accelerated, braked or turned cannot be learned
+from, and a long reverse teaches the opposite direction until it is outweighed.
 
 **Data flow.** A background thread (`ble.rs`) receives notifications, `protocol.rs`
 decodes them, `fusion.rs` converts them and `motion.rs` keeps the newest sample;
@@ -139,9 +166,9 @@ after conversion to the vehicle's frame.
 | `src/motion.rs` | The motion source (rest, recording or phone) and the shared latest phone sample. |
 | `src/replay.rs` | Reads and plays back the CSV recording. |
 | `src/protocol.rs` | Phone packet decoder (tested against `protocol/vectors.txt`) and control command. |
-| `src/fusion.rs` | Phone axes to vehicle axes, and the calibration. |
+| `src/fusion.rs` | Phone axes to vehicle axes, and learning which way is forward. |
 | `src/ble.rs` | BlueZ receiver thread: scan, connect, subscribe, reconnect. |
-| `src/control.rs` | Unix socket for `ams-dots-linux calibrate`. |
+| `src/control.rs` | Unix socket for `status`, `connect`, `disconnect`, `relearn`. |
 | `src/spring.rs` | The damped spring that smooths the motion. |
 | `src/particles.rs` | The dot generator: spawning, ageing, drift, size over life. No drawing. |
 | `src/dots.rs` | Paints a list of dots into an image. No Wayland. |

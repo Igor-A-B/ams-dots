@@ -17,6 +17,7 @@ import android.bluetooth.le.AdvertiseSettings
 import android.bluetooth.le.BluetoothLeAdvertiser
 import android.content.Context
 import android.os.Build
+import android.os.Handler
 import android.os.ParcelUuid
 import android.util.Log
 import com.amsdots.protocol.ControlCommand
@@ -47,7 +48,7 @@ interface PeripheralEvents {
 @SuppressLint("MissingPermission") // the service checks the Bluetooth permissions before it starts this
 class GattPeripheral(
     private val context: Context,
-    private val post: (() -> Unit) -> Unit,
+    private val handler: Handler,
     private val events: PeripheralEvents,
 ) : NotificationSink {
     private val manager = context.getSystemService(BluetoothManager::class.java)
@@ -58,6 +59,20 @@ class GattPeripheral(
     @Volatile private var central: BluetoothDevice? = null
     @Volatile private var subscribed = false
     private var advertising = false
+
+    /** Advertise fast (about 10 times a second) for a while after starting or losing the laptop, then slowly. */
+    private var fastAdvertising = true
+    private val relaxAdvertising = Runnable {
+        fastAdvertising = false
+        if (advertising) {
+            stopAdvertising()
+            startAdvertising()
+        }
+    }
+
+    private fun post(block: () -> Unit) {
+        handler.post(block)
+    }
 
     /** Opens the server; advertising starts once the service is registered. Returns an error message, or `null`. */
     fun start(): String? {
@@ -83,6 +98,7 @@ class GattPeripheral(
     }
 
     fun stop() {
+        handler.removeCallbacks(relaxAdvertising)
         stopAdvertising()
         central = null
         subscribed = false
@@ -112,8 +128,13 @@ class GattPeripheral(
 
     private fun startAdvertising() {
         if (advertising) return
+        // Waiting is cheap in low-power mode (one advertisement a second) but then the laptop needs up to a
+        // second to notice the phone. Right after the user pressed Start, or the link dropped, they are
+        // waiting for it, so advertise ten times as often for the first FAST_ADVERTISE_MS.
+        handler.removeCallbacks(relaxAdvertising)
+        if (fastAdvertising) handler.postDelayed(relaxAdvertising, FAST_ADVERTISE_MS)
         val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_POWER)
+            .setAdvertiseMode(if (fastAdvertising) AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY else AdvertiseSettings.ADVERTISE_MODE_LOW_POWER)
             .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
             .setConnectable(true)
             .setTimeout(0)
@@ -163,6 +184,7 @@ class GattPeripheral(
                 post {
                     if (wasSubscribed) events.onSubscribed(false)
                     events.onConnected(false)
+                    fastAdvertising = true
                     startAdvertising()
                 }
             }
@@ -225,6 +247,9 @@ class GattPeripheral(
 
     private companion object {
         const val TAG = "AmsDots"
+
+        /** How long to advertise in the fast mode after starting or losing the laptop. */
+        const val FAST_ADVERTISE_MS = 30_000L
 
         /** Client Characteristic Configuration descriptor, the standard switch for notifications. */
         val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")

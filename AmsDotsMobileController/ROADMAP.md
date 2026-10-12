@@ -43,7 +43,7 @@ optimisation.
 
 **Raw data from the phone, fusion on the laptop.** The phone sends sensor-frame
 values plus the gravity vector. Converting to vehicle axes (gravity gives "up",
-yaw rate = gyro projected on "up", forward axis from a calibrate command) happens
+yaw rate = gyro projected on "up", forward axis learned automatically from the driving itself) happens
 in the Rust app, so the phone does almost no work.
 
 **Kotlin Multiplatform split.** `shared/commonMain`: packet codec, motion sample
@@ -60,7 +60,7 @@ advertiser, foreground service, permission handling. No iOS target planned.
 | M3 | **BLE GATT server** (code done, device checks open) | Advertises, accepts a central, notifies a counter first, then real packets. Verified from the laptop with `bluetoothctl` (`menu gatt`, subscribe) and `btmon`. Sensors start/stop on subscribe/unsubscribe. |
 | M4 | **Energy tuning** (rate control done, measurements open) | Compare at least three profiles (batching latency, connection priority, rate) by 1 h screen-off battery drain; pick defaults; expose the rate through the control characteristic. |
 | M5 | **App UX** (not started; the MVP has only a Start/Stop button and a status line) | One status screen (armed / advertising / connected / rate), start-stop, permission and battery-optimisation flows, notification stop action, Quick Settings tile, recovery after process restart. |
-| M6 | **Laptop receiver** (in `AmsDotsLinux`) (code done, not yet tried with the phone) | `BleSource` using the `bluer` crate: scan, connect, subscribe, auto-reconnect; disconnected means zero motion so the dots settle. Decoder tested against `protocol/vectors.txt`. `Fusion` module with calibrate command. Replaces the CSV replay as the default source (CSV stays for development). |
+| M6 | **Laptop receiver** (in `AmsDotsLinux`) (code done, not yet tried with the phone) | `BleSource` using the `bluer` crate: scan, connect, subscribe, auto-reconnect; disconnected means zero motion so the dots settle. Decoder tested against `protocol/vectors.txt`. `Fusion` module that learns the forward direction by itself (no calibrate command), `status`/`connect`/`disconnect` commands and desktop notifications. Replaces the CSV replay as the default source (CSV stays for development). |
 | M7 | **Field test and tuning** | A real drive; sessions recorded to the CSV format of `AmsDotsLinux/tests/data/drive.csv` for replay and for tuning gains. |
 
 ## Main risks
@@ -70,7 +70,7 @@ advertiser, foreground service, permission handling. No iOS target planned.
 - BLE GATT error 133 and reconnect races on both sides.
 - Notification throttling when the connection interval is long.
 - Screen-off sensor delivery (decided in M2).
-- Phone orientation and calibration inside the vehicle.
+- Phone orientation inside the vehicle (learned automatically; unproven in a real car).
 - BlueZ access for the laptop daemon (D-Bus, user session).
 
 ## Status: MVP code complete, device verification open

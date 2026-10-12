@@ -82,7 +82,10 @@ class MotionSensors(context: Context, private val handler: Handler, private val 
     }
 
     private companion object {
-        /** How long the sensor hub may hold readings before waking the CPU: about four samples at 50 Hz. */
-        const val MAX_REPORT_LATENCY_US = 80_000
+        /**
+         * How long the sensor hub may hold readings before waking the CPU: two samples at 50 Hz, so the CPU
+         * wakes 25 times a second. Longer saves a little energy but adds that much delay to the dots (M4 may revisit).
+         */
+        const val MAX_REPORT_LATENCY_US = 40_000
     }
 }

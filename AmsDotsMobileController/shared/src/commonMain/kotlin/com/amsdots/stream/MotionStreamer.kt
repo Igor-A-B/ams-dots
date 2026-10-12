@@ -28,7 +28,7 @@ interface NotificationSink {
  */
 class MotionStreamer(
     private val sink: NotificationSink,
-    private val maxLatencyMs: Long = 120,
+    private val maxLatencyMs: Long = 60,
     private val maxBacklog: Int = 50,
 ) {
     private val queue = ArrayDeque<FusedSample>()

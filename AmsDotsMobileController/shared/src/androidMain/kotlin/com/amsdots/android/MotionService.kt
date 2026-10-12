@@ -58,7 +58,7 @@ class MotionService : Service(), PeripheralEvents {
         thread = HandlerThread("AmsDots-pipeline").also { it.start() }
         handler = Handler(thread.looper)
 
-        peripheral = GattPeripheral(this, post = { handler.post(it) }, events = this)
+        peripheral = GattPeripheral(this, handler, events = this)
         streamer = MotionStreamer(peripheral)
         peripheral.notificationSentListener = { streamer.onNotificationSent() }
         fuser = SensorFuser { sample ->
