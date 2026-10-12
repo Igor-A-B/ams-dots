@@ -3,4 +3,8 @@ name = "ams-dots-linux"
 version = "0.1.0"
 edition = "2024"
 
-[dependencie    s]
+[dependencies]
+serde = { version = "1.0.229", features = ["derive"] }
+smithay-client-toolkit = "0.21.1"
+tiny-skia = "0.12.0"
+toml = "1.1.8"
