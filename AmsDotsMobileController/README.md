@@ -1,20 +1,34 @@
-This is a Kotlin Multiplatform project targeting Android.
+# AmsDots mobile sender
 
-* [/shared](./shared/src) is for code that will be shared across your Compose Multiplatform applications.
-  It contains several subfolders:
-  - [commonMain](./shared/src/commonMain/kotlin) is for code that’s common for all targets.
-  - Other folders are for Kotlin code that will be compiled for only the platform indicated in the folder name.
-    For example, if you want to use Apple’s CoreCrypto for the iOS part of your Kotlin app,
-    the [iosMain](./shared/src/iosMain/kotlin) folder would be the right place for such calls.
-    Similarly, if you want to edit the Desktop (JVM) specific part, the [jvmMain](./shared/src/jvmMain/kotlin)
-    folder is the appropriate location.
+Android app that streams the phone's motion sensors over Bluetooth Low Energy to
+the Linux overlay in `../AmsDotsLinux`, which turns them into the moving dots
+(a copy of the iPhone's *Vehicle Motion Cues*). The plan, design decisions and
+milestone status are in [ROADMAP.md](ROADMAP.md); the wire format is in
+[docs/protocol.md](docs/protocol.md).
 
-### Running the apps
+## Layout
 
-Use the run configurations provided by the run widget in your IDE's toolbar. You can also use these commands and options:
+| Path | Contents |
+|---|---|
+| `shared/src/commonMain` | Platform-independent code: `protocol/` (packet codec, control commands) and the Compose UI (`App.kt`). |
+| `shared/src/androidMain` | Android-specific code (sensors, BLE, service; arrives in M2/M3). |
+| `shared/src/commonTest` | Codec unit tests. |
+| `shared/src/androidHostTest` | Tests that need the JVM, e.g. `GoldenVectorsTest`, which reads `protocol/vectors.txt`. |
+| `androidApp` | The Android application module (manifest, activity). |
+| `protocol/vectors.txt` | Test vectors for the packet format, shared with the Rust receiver. |
 
-- Android app: `./gradlew :androidApp:assembleDebug`
+## Commands
 
----
+```sh
+export PATH=$PATH:$HOME/Android/Sdk/platform-tools    # for adb
 
-Learn more about [Kotlin Multiplatform](https://www.jetbrains.com/help/kotlin-multiplatform-dev/get-started.html)…
+./gradlew :androidApp:assembleDebug                   # build the APK
+adb install -r androidApp/build/outputs/apk/debug/androidApp-debug.apk
+adb shell am start -n com.amsdots/.MainActivity       # launch it
+
+./gradlew :shared:testAndroidHostTest                 # all unit tests (common + host)
+./gradlew :shared:testAndroidHostTest --tests '*PacketCodecTest'   # one class
+```
+
+The protocol vectors are the contract between phone and laptop: after changing
+the packet format, update `docs/protocol.md` and `protocol/vectors.txt` first.
