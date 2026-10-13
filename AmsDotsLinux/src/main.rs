@@ -1,151 +1,198 @@
 mod ble;
+mod cli;
 mod config;
 mod control;
 mod dots;
 mod fusion;
+mod manual;
 mod motion;
 mod overlay;
 mod particles;
 mod picker;
 mod protocol;
 mod replay;
+mod service;
 mod spring;
 
+use cli::{Options, Parsed, USAGE};
+use config::Settings;
+use manual::Manual;
 use motion::{Live, MotionSource};
-use picker::Startup;
+use picker::{Startup, Target};
 use std::io::IsTerminal;
+use std::sync::Arc;
 use std::time::Duration;
 
-const USAGE: &str = "\
-usage: ams-dots-linux [options] [recording.csv]
-       ams-dots-linux status [--watch] | phones | select [N|NAME|any] | forget | connect | disconnect | relearn
-
-Starts the overlay and shows dots that move with the phone running the AmsDots
-app. The first time it lists the phones in range and asks which one to follow;
-after that it connects to the last phone by itself. The other commands talk to
-an overlay that is already running (from a second terminal).
-
-options:
-  --phone NAME   follow the phone with this Bluetooth name, or `any`; no question asked
-  --pick         list the phones and ask, even if a last phone is remembered
-  --rate HZ      ask the phone to sample at HZ (10-100; its default is 50)
-  --record FILE  write every sample from the phone (raw and fused) to FILE as CSV
-  --config FILE  use another config file (default ~/.config/ams-dots/config.toml)
-  --no-phone     no Bluetooth: dots stay at rest
-  recording.csv  no Bluetooth: replay a recorded drive (tests/data/drive.csv)
-  -h, --help     this text
-
-commands:
-  status           link state, phone, packet rate, forward direction
-  status --watch   the same as one live line (shake the phone and watch it move)
-  phones           phones heard lately (numbered), marking the connected and the last one
-  select           switch phone: shows the list and asks; or `select 2`, `select NAME`, `select any`
-  forget           forget the last phone (the next start asks again)
-  connect          start looking for the phone again
-  disconnect       drop the phone and stop looking until `connect`
-  relearn          forget the learned forward direction (after moving the phone)";
+/// Commands that are sent to the running overlay as they are.
+const REMOTE_COMMANDS: [&str; 12] =
+    ["status", "phones", "select", "forget", "connect", "disconnect", "relearn", "move", "speed", "direction", "auto", "reload"];
 
 /// How long the start-up scan listens for phones.
 const PICKER_SCAN: Duration = Duration::from_secs(4);
 
 fn main() {
-    if let Err(err) = start() {
+    if let Err(err) = dispatch() {
         eprintln!("ams-dots: {err}");
         std::process::exit(1);
     }
 }
 
-fn start() -> Result<(), String> {
-    let mut config_path: Option<String> = None;
-    let mut recording_path: Option<String> = None;
-    let mut phone_name: Option<String> = None;
-    let mut rate_hz: Option<u8> = None;
-    let mut record_path: Option<String> = None;
-    let mut use_phone = true;
-    let mut pick = false;
-
-    let mut args = std::env::args().skip(1).peekable();
-    if let Some(command @ ("status" | "phones" | "select" | "forget" | "connect" | "disconnect" | "relearn")) =
-        args.peek().map(String::as_str)
-    {
-        let command = command.to_string();
-        args.next();
-        let rest: Vec<String> = args.collect();
-        if command == "status" && rest.first().map(String::as_str) == Some("--watch") {
-            return control::watch();
-        }
-        if command == "select" && rest.is_empty() && std::io::stdin().is_terminal() {
-            println!("{}", control::select_interactive()?);
-            return Ok(());
-        }
-        println!("{}", control::send(&format!("{command} {}", rest.join(" ")))?);
-        return Ok(());
-    }
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "-h" | "--help" => {
-                println!("{USAGE}");
-                return Ok(());
-            }
-            "--config" => config_path = Some(args.next().ok_or(format!("--config needs a file\n\n{USAGE}"))?),
-            "--phone" => phone_name = Some(args.next().ok_or(format!("--phone needs a name (or `any`)\n\n{USAGE}"))?),
-            "--rate" => {
-                let text = args.next().ok_or(format!("--rate needs a number of Hz\n\n{USAGE}"))?;
-                let hz: u8 = text.parse().map_err(|_| format!("--rate: {text:?} is not a number of Hz\n\n{USAGE}"))?;
-                if !(protocol::MIN_RATE_HZ..=protocol::MAX_RATE_HZ).contains(&hz) {
-                    return Err(format!("--rate must be {}-{} Hz", protocol::MIN_RATE_HZ, protocol::MAX_RATE_HZ));
-                }
-                rate_hz = Some(hz);
-            }
-            "--record" => record_path = Some(args.next().ok_or(format!("--record needs a file\n\n{USAGE}"))?),
-            "--pick" => pick = true,
-            "--no-phone" => use_phone = false,
-            _ if arg.starts_with('-') => return Err(format!("unknown option {arg}\n\n{USAGE}")),
-            _ => recording_path = Some(arg),
-        }
-    }
-
-    let config = config::load(config_path.as_deref())?;
-    let motion = match recording_path {
-        Some(path) => MotionSource::Replay(replay::load(&path)?),
-        None if use_phone => {
-            let Some((target, remember)) = choose_target(phone_name, pick)? else { return Ok(()) };
-            eprintln!("ams-dots: following {}. Stop with Ctrl+C.", target.describe());
-            eprintln!("ams-dots: to change phone while it runs:  ams-dots-linux select   (list: ams-dots-linux phones)");
-            let exe = std::env::current_exe().map_or_else(|_| "ams-dots-linux".to_string(), |p| p.display().to_string());
-            eprintln!("ams-dots: to watch the link, run in another terminal:  {exe} status --watch");
-            let live = Live::new();
-            live.set_target(target);
-            if let Some(path) = &record_path {
-                let file = std::fs::File::create(path).map_err(|e| format!("--record {path}: {e}"))?;
-                live.record_to(Box::new(std::io::BufWriter::new(file))).map_err(|e| format!("--record {path}: {e}"))?;
-                eprintln!("ams-dots: recording every sample to {path}");
-            }
-            ble::spawn(live.clone(), rate_hz, remember);
-            ble::disconnect_on_exit(live.clone());
-            MotionSource::Live(live)
-        }
-        None => MotionSource::Rest,
+fn dispatch() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (command, rest) = match args.split_first() {
+        Some((first, rest)) => (first.as_str(), rest),
+        None => ("start", &args[..]),
     };
-    overlay::run(config, motion)
+    match command {
+        "start" => start(rest),
+        "stop" => {
+            println!("{}", service::stop()?);
+            Ok(())
+        }
+        "restart" => {
+            // Check the options and the config before stopping what works.
+            if let Parsed::Start(options) = Options::parse(rest)? {
+                Settings::load(options.config_path)?;
+            }
+            service::stop()?;
+            start(rest)
+        }
+        "status" if rest.first().map(String::as_str) == Some("--watch") => control::watch(),
+        "select" if rest.is_empty() && std::io::stdin().is_terminal() => {
+            println!("{}", control::select_interactive()?);
+            Ok(())
+        }
+        command if REMOTE_COMMANDS.contains(&command) => {
+            println!("{}", control::send(&format!("{command} {}", rest.join(" ")))?);
+            Ok(())
+        }
+        // Options without a command word: `ams-dots-linux --no-phone`.
+        _ => start(&args),
+    }
 }
 
-/// Decides which phone to follow, and whether to store the phone that connects as the last known one.
-/// A phone chosen before (or `--phone`) is used without a question; with none remembered the user picks from
-/// the list of phones in range (or, without a terminal to ask on, the first one found is used).
-/// `None` = the user quit.
-fn choose_target(phone_name: Option<String>, pick: bool) -> Result<Option<(picker::Target, bool)>, String> {
+/// `start`: in the background by default, so the terminal is free again.
+fn start(args: &[String]) -> Result<(), String> {
+    let options = match Options::parse(args)? {
+        Parsed::Help => {
+            println!("{USAGE}");
+            return Ok(());
+        }
+        Parsed::Start(options) => options,
+    };
+    if control::is_running() {
+        let note = if args.is_empty() { "" } else { " (the options were not applied; `ams-dots-linux restart` with them does)" };
+        println!("ams-dots is already running{note}. `ams-dots-linux status` shows what it does, `--help` lists the controls.");
+        return Ok(());
+    }
+    let mut options = options;
+    // Questions are asked here, where the terminal is, before the background process takes over.
+    if let Some(chosen) = ask_for_phone(&options)? {
+        match chosen {
+            // The chosen phone is stored by the picker, and the overlay picks it up from there.
+            Some(Target { name: Some(_) }) => {}
+            Some(Target { name: None }) => options.phone_name = Some("any".to_string()),
+            None => return Ok(()),
+        }
+    }
+    if options.foreground {
+        return run(options);
+    }
+    let message = service::launch(&options.background_args()?)?;
+    println!("ams-dots {message}");
+    println!("Control it from any terminal: `ams-dots-linux move down 60`, `auto`, `status`, `stop`; `--help` lists everything.");
+    Ok(())
+}
+
+/// Runs the phone list when the start-up rules (see `picker::startup`) call for it and there is a terminal.
+/// `None`: nothing to ask. `Some(None)`: the user quit. `Some(Some(target))`: the choice.
+fn ask_for_phone(options: &Options) -> Result<Option<Option<Target>>, String> {
+    if options.no_phone || options.recording_path.is_some() {
+        return Ok(None);
+    }
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let last = picker::remembered();
-    match picker::startup(phone_name.as_deref(), pick, last.as_deref(), interactive)? {
-        Startup::Follow { target, remember } => Ok(Some((target, remember))),
-        Startup::Ask => Ok(picker::ask(
+    match picker::startup(options.phone_name.as_deref(), options.pick, last.as_deref(), interactive)? {
+        Startup::Follow { .. } => Ok(None),
+        Startup::Ask => Ok(Some(picker::ask(
             last.as_deref(),
             picker::remember,
             || ble::scan(PICKER_SCAN),
             &mut std::io::stdin().lock(),
             &mut std::io::stdout(),
-        )?
-        .map(|target| (target, true))),
+        )?)),
+    }
+}
+
+/// The overlay itself, in this process: what the background process runs, and `--foreground` runs here.
+fn run(options: Options) -> Result<(), String> {
+    let settings = Settings::load(options.config_path.clone())?;
+    let manual = Manual::new();
+    let live = Live::new();
+
+    let replay = match &options.recording_path {
+        Some(path) => Some(replay::load(path)?),
+        None => None,
+    };
+    let has_phone = replay.is_none();
+    let mut remember = false;
+    if has_phone {
+        // Without a terminal (the background process) the choice made at the prompt is found in the memory.
+        let (target, remember_it) = choose_target(&options)?;
+        live.set_target(target.clone());
+        remember = remember_it;
+        if options.no_phone {
+            // Nothing touches Bluetooth until `connect`.
+            live.set_enabled(false);
+            eprintln!("ams-dots: no phone for now; `ams-dots-linux connect` looks for {}", target.describe());
+        } else {
+            eprintln!("ams-dots: following {}", target.describe());
+        }
+        if let Some(path) = &options.record_path {
+            let file = std::fs::File::create(path).map_err(|e| format!("--record {path}: {e}"))?;
+            live.record_to(Box::new(std::io::BufWriter::new(file))).map_err(|e| format!("--record {path}: {e}"))?;
+            eprintln!("ams-dots: recording every sample to {path}");
+        }
+    }
+    let motion = match replay {
+        Some(samples) => MotionSource::Replay(samples),
+        None => MotionSource::Live(live.clone()),
+    };
+
+    let context = Arc::new(control::Context { live: live.clone(), manual: manual.clone(), settings: settings.clone(), phone: has_phone });
+    let rate_hz = options.rate_hz;
+    let ready = move || {
+        control::spawn(context);
+        service::shutdown_on_signals(live.clone());
+        if has_phone {
+            ble::spawn(live, rate_hz, remember);
+        }
+        eprintln!("ams-dots: running. Control it from another terminal: `ams-dots-linux --help` lists the commands, `ams-dots-linux stop` ends it.");
+    };
+    overlay::run(settings, manual, motion, ready)
+}
+
+/// Decides which phone to follow, and whether to store the phone that connects as the last known one.
+/// A phone chosen before (or `--phone`) is used without a question; with none remembered the user picks from
+/// the list of phones in range (or, without a terminal to ask on, the first one found is used).
+/// With `--no-phone` nothing is asked: the target is what `connect` will look for later.
+fn choose_target(options: &Options) -> Result<(Target, bool), String> {
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let last = picker::remembered();
+    if options.no_phone {
+        return Ok((last.as_deref().map_or_else(Target::any, Target::named), true));
+    }
+    match picker::startup(options.phone_name.as_deref(), options.pick, last.as_deref(), interactive)? {
+        Startup::Follow { target, remember } => Ok((target, remember)),
+        Startup::Ask => {
+            let chosen = picker::ask(
+                last.as_deref(),
+                picker::remember,
+                || ble::scan(PICKER_SCAN),
+                &mut std::io::stdin().lock(),
+                &mut std::io::stdout(),
+            )?;
+            chosen.map(|target| (target, true)).ok_or_else(|| "no phone chosen".to_string())
+        }
     }
 }

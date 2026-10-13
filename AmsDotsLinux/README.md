@@ -20,6 +20,8 @@ Bluetooth) lives in `../AmsDotsMobileController`.
 | `phones`, `select`, `forget`: list and switch phones while the overlay runs | done |
 | Automatic "forward" direction (learned from driving, no calibration step) | done (simulated drives; not yet tried in a car) |
 | `status`, `connect`, `disconnect` commands, link messages on stderr | done |
+| Runs as a background service: start returns the terminal; `stop`, `restart`, `reload` | done |
+| Manual control of direction and speed (`move`, `speed`, `direction`, `auto`), no phone needed | done (checked through the control socket; the dots themselves not seen on screen) |
 
 ## Quick start
 
@@ -35,6 +37,14 @@ install the app, open it and press **Start** ("Waiting for the laptop").
 cargo run --release
 ```
 
+The overlay starts **in the background and the terminal is free again**: it
+keeps running if you close the terminal, and everything after this (switching
+phone, setting the dots by hand, reloading the config, stopping) is a command
+you run from any terminal, with no restart (see *Running as a service* and
+*Manual control* below). Its messages go to
+`~/.local/state/ams-dots/ams-dots.log`. `cargo run --release -- --foreground`
+keeps it in the terminal instead (messages on screen, Ctrl+C stops it).
+
 The first build takes a minute. **The first time** the app scans for 4 seconds
 and lists the phones that run the AmsDots app:
 
@@ -46,10 +56,10 @@ number or Enter to connect, r = rescan, a = first phone that appears, q = quit:
 Type the number (or Enter for the one marked), and the dots start following that
 phone. **From then on it connects to that phone by itself, with no question**:
 the last phone chosen or connected is remembered in
-`~/.local/state/ams-dots/phone`. The terminal says "connected, receiving
-motion". Stop with Ctrl+C; that also disconnects the phone cleanly.
+`~/.local/state/ams-dots/phone`. The log says "connected, receiving motion".
+`ams-dots-linux stop` ends the overlay; that also disconnects the phone cleanly.
 
-**To use another phone**, while the overlay runs (second terminal):
+**To use another phone**, while the overlay runs:
 
 ```sh
 ams-dots-linux phones          # phones heard lately, marking the connected and the last one
@@ -61,7 +71,7 @@ ams-dots-linux forget          # forget the last phone: the next start asks agai
 or start with `--pick` to see the list at start-up even though a phone is
 remembered. `select` also remembers the new phone.
 
-**3. To watch the link** (second terminal, overlay still running):
+**3. To watch the link** (overlay running):
 
 ```sh
 cargo run --release -- status --watch
@@ -75,12 +85,78 @@ the forward / lateral / yaw values the dots get. Shake the phone to see them mov
 
 ```sh
 cargo install --path . --root ~/.local
-ams-dots-linux                      # overlay with phone picker
-ams-dots-linux status --watch
+ams-dots-linux                      # start the overlay (background), phone picker the first time
+ams-dots-linux move down 60         # set the dots by hand
+ams-dots-linux stop
 ams-dots-linux --help
 ```
 
 Without installing, the same binary is `./target/release/ams-dots-linux`.
+
+## Running as a service
+
+Starting the overlay never holds the terminal. `ams-dots-linux` (or `start`)
+runs the program again in the background, in a session of its own, and returns
+once the overlay is up (a start that cannot work, e.g. no layer-shell or a bad
+config, is reported right there with the end of the log). After that nothing
+needs restarting: every setting that used to be a start-up option is a command
+for the running overlay.
+
+| To... | Run (while it runs) |
+|---|---|
+| set the dots by hand, or give control back | `move`, `speed`, `direction`, `auto` (see *Manual control*) |
+| use another phone, or none | `select`, `connect`, `disconnect` |
+| apply an edited config file | `reload` |
+| see what it does | `status`, `status --watch`, the log `~/.local/state/ams-dots/ams-dots.log` |
+| end it | `stop` |
+| change a start-up option (`--config`, `--rate`, a recording...) | `restart [options]` (a bad option or config is refused before anything is stopped) |
+
+Starting while it already runs does nothing but say so. The log of the
+previous run is kept as `ams-dots.log.old`. `--foreground` keeps the overlay in
+the terminal, which is what to use for debugging or under a service manager.
+
+**At login.** The simplest is an autostart line in the compositor, e.g. for
+Hyprland `exec-once = ams-dots-linux`; it returns at once. Without a terminal
+there is no question: the last phone is used. A systemd user unit is in
+`contrib/ams-dots.service` (copy to `~/.config/systemd/user/`, then
+`systemctl --user enable --now ams-dots`); it needs the session's
+`WAYLAND_DISPLAY`, so the compositor must import its environment into systemd
+(`dbus-update-activation-environment --systemd WAYLAND_DISPLAY`).
+
+## Manual control
+
+Without the phone, or to try the dots out, set where they flow and how fast:
+
+```sh
+ams-dots-linux move down 60      # towards DIRECTION at SPEED percent of the maximum (default 50)
+ams-dots-linux move up-left
+ams-dots-linux direction left    # change one thing: a name, degrees, or relative (+15 turns clockwise)
+ams-dots-linux direction +15
+ams-dots-linux speed 80          # percent; also speed +10 / speed -10 / speed 0
+ams-dots-linux auto              # the phone drives the dots again
+```
+
+- **Direction**: `up`, `down`, `left`, `right`, `up-left`, `up-right`,
+  `down-left`, `down-right`, or degrees clockwise from the top (`0` up, `90`
+  right, `180` down, `270` left). The dots flow *towards* it.
+- **Speed**: percent of `motion.max_speed` (250 px/s by default), so `100` is
+  the fastest the dots ever drift. More speed also means more dots, as with
+  real motion, and changes ramp smoothly through the same spring.
+- While manual control is on the phone is ignored (it stays connected);
+  `status` says `moved by hand: ...`. `speed 0` keeps manual control on with
+  the dots still. The last direction and speed are remembered by `auto`, so
+  `speed 30` later resumes in the old direction.
+- It works with `--no-phone`, with a phone, and while replaying a recording.
+- The overlay cannot take keys or clicks (it is click-through), so bind the
+  commands to compositor keys instead, e.g. in Hyprland:
+
+```
+bind = $mod, equal, exec, ams-dots-linux speed +10
+bind = $mod, minus, exec, ams-dots-linux speed -10
+bind = $mod, right, exec, ams-dots-linux direction +15
+bind = $mod, left,  exec, ams-dots-linux direction -15
+bind = $mod, 0,     exec, ams-dots-linux auto
+```
 
 ## Build and run, all variants
 
@@ -91,10 +167,13 @@ river, ...; GNOME does not).
 cargo run --release                      # follow the last phone over Bluetooth (first time: pick from a list)
 cargo run --release -- --pick            # always show the list of phones first
 cargo run --release -- --phone "Redmi Note 12 Pro 5G"   # skip the list (also `--phone any`)
-cargo run --release -- --no-phone        # vehicle at rest: dots shimmer in place
+cargo run --release -- --no-phone        # no Bluetooth: dots at rest or set by hand (`connect` adds the phone later)
 cargo run --release -- tests/data/drive.csv   # replay a mock drive (loops every 30 s)
 cargo run --release -- --config my.toml  # use another config file
 cargo run --release -- --rate 30         # ask the phone for 30 Hz (10-100; its default is 50)
+cargo run --release -- --foreground      # stay in this terminal; Ctrl+C stops (combines with the others)
+cargo run --release -- stop | restart [options] | reload
+cargo run --release -- move DIR [SPEED] | speed N | direction D | auto
 cargo run --release -- status [--watch]  # what the running overlay sees
 cargo run --release -- phones | select [N|NAME|any] | forget   # list / switch / forget the phone
 cargo run --release -- connect | disconnect | relearn   # control the running overlay
@@ -107,7 +186,8 @@ the first one found if none was ever chosen (and that one is then remembered).
 If the last phone is not in range, the app keeps waiting for *that* phone and
 never grabs another one; `status` says `scanning for "NAME"`.
 
-Stop with Ctrl+C. Optional Hyprland rule to skip the open/close animation:
+Stop with `ams-dots-linux stop` (or Ctrl+C / SIGTERM; all disconnect the phone
+cleanly). Optional Hyprland rule to skip the open/close animation:
 
 ```
 layerrule = noanim, ams-dots
@@ -158,7 +238,9 @@ with its default and meaning:
 | `[spring]` | `stiffness`, `damping_ratio` | smoothing behaviour |
 | `[display]` | `fps` | redraws per second |
 
-The file is read once at startup; restart to apply changes.
+The file is read at startup. After editing it run `ams-dots-linux reload`: the
+new values apply at once (the dots start over). A file with an error is refused
+and the running settings stay as they were.
 
 ## Phone over Bluetooth
 
@@ -169,7 +251,7 @@ chose, or the last one it followed. No pairing is
 needed. Phones are told apart by their Bluetooth name, because the phone's
 random Bluetooth address changes every time its link is started. The receiver never
 gives up: if the phone leaves or the link drops, the dots settle (no motion
-means a vehicle at rest) and it scans again. Messages go to stderr. BlueZ must
+means a vehicle at rest) and it scans again. Messages go to the log (or the terminal with `--foreground`). BlueZ must
 be running with a powered adapter (`systemctl status bluetooth`).
 
 **Interactive.** The overlay tells you what the link is doing: every change is
@@ -237,7 +319,10 @@ after conversion to the vehicle's frame.
 
 | File | Responsibility |
 |---|---|
-| `src/main.rs` | Command line, chooses the motion source, starts the overlay. |
+| `src/main.rs` | Command dispatch, start (background or `--foreground`), chooses the motion source. |
+| `src/cli.rs` | Start-up options and the `--help` text. |
+| `src/service.rs` | Background start (new session, log file, waits until up), `stop`, clean shutdown on signals. |
+| `src/manual.rs` | Manual direction and speed (`move`, `speed`, `direction`, `auto`), turned into motion for the dots. |
 | `src/config.rs` | TOML settings, defaults and validation. |
 | `src/motion.rs` | The motion source (rest, recording or phone) and the shared latest phone sample. |
 | `src/replay.rs` | Reads and plays back the CSV recording. |
@@ -245,7 +330,7 @@ after conversion to the vehicle's frame.
 | `src/fusion.rs` | Phone axes to vehicle axes, and learning which way is forward. |
 | `src/picker.rs` | The list of phones, the remembered last phone, the start-up decision (ask or connect), matching by name. |
 | `src/ble.rs` | BlueZ receiver thread: scan, connect, subscribe, reconnect, clean disconnect on exit. |
-| `src/control.rs` | Unix socket for `status`, `phones`, `select`, `forget`, `connect`, `disconnect`, `relearn`. |
+| `src/control.rs` | Unix socket for `status`, `phones`, `select`, `forget`, `connect`, `disconnect`, `relearn`, `move`, `speed`, `direction`, `auto`, `reload`, `stop`. Runs in every mode. |
 | `src/spring.rs` | The damped spring that smooths the motion. |
 | `src/particles.rs` | The dot generator: spawning, ageing, drift, size over life. No drawing. |
 | `src/dots.rs` | Paints a list of dots into an image. No Wayland. |
@@ -321,7 +406,11 @@ picture. Terms used in `overlay.rs`:
   `SEGV`, update `bluez` (upstream fixed several crashes after 5.87).
 - **Connected but no motion.** The log says so after 8 s: the Bluetooth link
   needs an MTU of at least 64 (the phone negotiates 517 normally).
-- Everything the app does is printed on stderr; run it from a terminal.
+- Everything the app does is written to `~/.local/state/ams-dots/ams-dots.log`
+  (`tail -f` it), or shown in the terminal with `--foreground`.
+- **`ams-dots is already running`** but nothing is visible: `ams-dots-linux stop`
+  (or `restart`). A crashed run leaves a stale socket file, which does not count
+  as running and is replaced at the next start.
 
 ## Known limitations
 
@@ -331,11 +420,11 @@ picture. Terms used in `overlay.rs`:
 - Fractional scaling (e.g. the laptop panel at 1.333) is not handled: the
   compositor stretches our 1x image, so dots are slightly soft there. Fixing it
   needs the `wp-fractional-scale` and `wp-viewporter` protocols.
-- Config is read once; there is no live reload.
+- A config `reload` restarts the dots (they respawn) rather than morphing them.
 
 ## Dependencies
 
 - `smithay-client-toolkit`: safe Rust helpers over the Wayland protocol.
 - `tiny-skia`: small CPU 2D renderer used to paint anti-aliased circles.
 - `serde`, `toml`: reading the configuration file.
-- `bluer` (BlueZ over D-Bus, needs `libdbus` headers to build), `tokio`, `futures`: the Bluetooth receiver. `signal-hook`: disconnect cleanly on Ctrl+C.
+- `bluer` (BlueZ over D-Bus, needs `libdbus` headers to build), `tokio`, `futures`: the Bluetooth receiver. `signal-hook`: disconnect cleanly on Ctrl+C. `libc`: `setsid` for the background start.

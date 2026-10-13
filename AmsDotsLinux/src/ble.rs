@@ -19,7 +19,6 @@
 //!
 //! Feedback: every change of the link is printed on stderr.
 
-use crate::control;
 use crate::motion::{LinkState, Live};
 use crate::picker::{self, Candidate, Target};
 use crate::protocol::{self, CONTROL_UUID, MOTION_UUID, SERVICE_UUID};
@@ -47,17 +46,16 @@ fn service_uuid() -> Uuid {
     Uuid::parse_str(SERVICE_UUID).expect("valid service UUID")
 }
 
-/// Starts the receiver thread, which follows the phone in [`Live::target`]. `rate_hz`, if given, is sent to
-/// the phone after each connect. With `remember`, the phone that connects is stored as the last known one,
-/// so the next start connects to it by itself.
+/// Starts the receiver thread, which follows the phone in [`Live::target`] (it touches Bluetooth only while
+/// [`Live::is_enabled`], so a start with `--no-phone` leaves it idle until `connect`). `rate_hz`, if given, is
+/// sent to the phone after each connect. With `remember`, the phone that connects is stored as the last known
+/// one, so the next start connects to it by itself.
 pub fn spawn(live: Arc<Live>, rate_hz: Option<u8>, remember: bool) {
     std::thread::Builder::new()
         .name("ams-dots-ble".into())
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("async runtime");
-            runtime.block_on(async {
-                tokio::join!(connection_loop(live.clone(), rate_hz, remember), control::serve(live));
-            });
+            runtime.block_on(connection_loop(live, rate_hz, remember));
         })
         .expect("spawn the Bluetooth thread");
 }
@@ -123,23 +121,6 @@ async fn fresh_phones(adapter: &Adapter) -> bluer::Result<Vec<(Device, Candidate
         phones.push((device, candidate));
     }
     Ok(phones)
-}
-
-/// Makes Ctrl+C and SIGTERM disconnect the phone before the process ends. Killing the process while connected
-/// would leave the connection open in BlueZ: the phone then stops advertising and the next run cannot find it.
-pub fn disconnect_on_exit(live: Arc<Live>) {
-    use signal_hook::consts::{SIGINT, SIGTERM};
-    let Ok(mut signals) = signal_hook::iterator::Signals::new([SIGINT, SIGTERM]) else { return };
-    std::thread::spawn(move || {
-        if signals.forever().next().is_some() {
-            live.set_enabled(false);
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while live.is_connected() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            std::process::exit(130);
-        }
-    });
 }
 
 /// Reports a change of the link on stderr.

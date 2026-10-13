@@ -90,16 +90,22 @@ pub trait PhoneMemory {
     fn forget(&self);
 }
 
+/// Where the app keeps what must outlive a run (the last phone, the log): `$XDG_STATE_HOME/ams-dots`,
+/// default `~/.local/state/ams-dots`.
+pub fn state_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
+    base.map(|b| b.join("ams-dots"))
+}
+
 /// The phone is remembered in a one-line file.
 pub struct FileMemory(Option<PathBuf>);
 
 impl FileMemory {
     /// `$XDG_STATE_HOME/ams-dots/phone`, default `~/.local/state/ams-dots/phone`.
     pub fn default_location() -> Self {
-        let base = std::env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
-        Self(base.map(|b| b.join("ams-dots").join("phone")))
+        Self(state_dir().map(|dir| dir.join("phone")))
     }
 
     #[cfg(test)]

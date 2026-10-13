@@ -6,6 +6,8 @@
 //! key.
 
 use serde::Deserialize;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -122,6 +124,60 @@ pub fn load(path: Option<&str>) -> Result<Config, String> {
     }
 }
 
+/// The settings of the running overlay. `ams-dots-linux reload` re-reads the file into it; the overlay notices
+/// the new [`Settings::generation`] on its next frame and starts again with the new values.
+pub struct Settings {
+    /// `--config`, or `None` for the default location.
+    path: Option<String>,
+    config: Mutex<Config>,
+    generation: AtomicU64,
+}
+
+impl Settings {
+    /// Reads the settings for the first time; a broken file is an error here (the overlay does not start).
+    pub fn load(path: Option<String>) -> Result<Arc<Self>, String> {
+        let config = load(path.as_deref())?;
+        Ok(Self::new(path, config))
+    }
+
+    fn new(path: Option<String>, config: Config) -> Arc<Self> {
+        Arc::new(Self { path, config: Mutex::new(config), generation: AtomicU64::new(0) })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Config> {
+        self.config.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn config(&self) -> Config {
+        self.lock().clone()
+    }
+
+    /// Changes whenever a [`Settings::reload`] succeeds; cheap enough to check every frame.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// The settings and the generation they belong to.
+    pub fn snapshot(&self) -> (Config, u64) {
+        let config = self.lock();
+        (config.clone(), self.generation())
+    }
+
+    /// Reads the file again. If it cannot be read or is invalid the running settings stay as they are.
+    pub fn reload(&self) -> Result<(), String> {
+        let config = load(self.path.as_deref())?;
+        let mut current = self.lock();
+        *current = config;
+        self.generation.fetch_add(1, Ordering::Release);
+        Ok(())
+    }
+
+    /// The file the settings come from, for messages.
+    pub fn source(&self) -> String {
+        self.path.clone().or_else(default_path).unwrap_or_else(|| "the built-in defaults".to_string())
+    }
+}
+
 /// Parses and validates TOML text.
 pub fn parse(text: &str) -> Result<Config, String> {
     let config: Config = toml::from_str(text).map_err(|e| e.to_string())?;
@@ -178,6 +234,56 @@ mod tests {
         assert!(err.contains("dots.lifetime"));
         assert!(parse("[dots]\nfade_in = 70.0\nfade_out = 40.0\n").is_err());
         assert!(parse("[display]\nfps = 0\n").is_err());
+    }
+
+    /// A config file in the temp directory, removed when dropped.
+    struct TempConfig(std::path::PathBuf);
+
+    impl TempConfig {
+        fn new(name: &str, text: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("ams-dots-test-{}-{name}.toml", std::process::id()));
+            std::fs::write(&path, text).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> String {
+            self.0.display().to_string()
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn reload_applies_the_changed_file_and_bumps_the_generation() {
+        let file = TempConfig::new("reload-ok", "[dots]\nsize = 12.0\n");
+        let settings = Settings::load(Some(file.path())).unwrap();
+        assert_eq!(settings.snapshot().0.dots.size, 12.0);
+        let before = settings.generation();
+        std::fs::write(&file.0, "[dots]\nsize = 20.0\n").unwrap();
+        settings.reload().unwrap();
+        assert_eq!(settings.config().dots.size, 20.0);
+        assert!(settings.generation() > before);
+    }
+
+    #[test]
+    fn a_broken_file_on_reload_changes_nothing() {
+        let file = TempConfig::new("reload-broken", "[dots]\nsize = 12.0\n");
+        let settings = Settings::load(Some(file.path())).unwrap();
+        let before = settings.generation();
+        std::fs::write(&file.0, "[dots]\nsize = -1.0\n").unwrap();
+        let err = settings.reload().unwrap_err();
+        assert!(err.contains("dots.size"), "{err}");
+        assert_eq!(settings.config().dots.size, 12.0);
+        assert_eq!(settings.generation(), before, "the overlay must not restart for a refused file");
+    }
+
+    #[test]
+    fn a_missing_explicit_file_is_refused_at_load() {
+        assert!(Settings::load(Some("/nonexistent/ams-dots.toml".to_string())).is_err());
     }
 
     #[test]
