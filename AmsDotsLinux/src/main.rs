@@ -29,6 +29,7 @@ options:
   --phone NAME   follow the phone with this Bluetooth name, or `any`; no question asked
   --pick         list the phones and ask, even if a last phone is remembered
   --rate HZ      ask the phone to sample at HZ (10-100; its default is 50)
+  --record FILE  write every sample from the phone (raw and fused) to FILE as CSV
   --config FILE  use another config file (default ~/.config/ams-dots/config.toml)
   --no-phone     no Bluetooth: dots stay at rest
   recording.csv  no Bluetooth: replay a recorded drive (tests/data/drive.csv)
@@ -59,6 +60,7 @@ fn start() -> Result<(), String> {
     let mut recording_path: Option<String> = None;
     let mut phone_name: Option<String> = None;
     let mut rate_hz: Option<u8> = None;
+    let mut record_path: Option<String> = None;
     let mut use_phone = true;
     let mut pick = false;
 
@@ -95,6 +97,7 @@ fn start() -> Result<(), String> {
                 }
                 rate_hz = Some(hz);
             }
+            "--record" => record_path = Some(args.next().ok_or(format!("--record needs a file\n\n{USAGE}"))?),
             "--pick" => pick = true,
             "--no-phone" => use_phone = false,
             _ if arg.starts_with('-') => return Err(format!("unknown option {arg}\n\n{USAGE}")),
@@ -113,6 +116,11 @@ fn start() -> Result<(), String> {
             eprintln!("ams-dots: to watch the link, run in another terminal:  {exe} status --watch");
             let live = Live::new();
             live.set_target(target);
+            if let Some(path) = &record_path {
+                let file = std::fs::File::create(path).map_err(|e| format!("--record {path}: {e}"))?;
+                live.record_to(Box::new(std::io::BufWriter::new(file))).map_err(|e| format!("--record {path}: {e}"))?;
+                eprintln!("ams-dots: recording every sample to {path}");
+            }
             ble::spawn(live.clone(), rate_hz, remember);
             ble::disconnect_on_exit(live.clone());
             MotionSource::Live(live)

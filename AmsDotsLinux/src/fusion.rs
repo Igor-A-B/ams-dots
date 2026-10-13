@@ -155,9 +155,13 @@ impl Fusion {
         self.learn(up, accel, yaw, dt.clamp(0.0, MAX_DT));
 
         let hint = *self.forward_hint.get_or_insert_with(|| guess_forward(up));
-        let flat = sub(hint, scale(up, dot(hint, up)));
+        let mut flat = sub(hint, scale(up, dot(hint, up)));
         if norm(flat) < MIN_HORIZONTAL_HINT {
-            return Motion { yaw, ..Motion::default() };
+            // "Forward" now points up or down: the phone was turned (e.g. started lying flat, then put upright
+            // in a holder), so what was learned in its old pose no longer means anything. Start over from this pose.
+            self.relearn();
+            let hint = *self.forward_hint.insert(guess_forward(up));
+            flat = sub(hint, scale(up, dot(hint, up)));
         }
         let forward = normalize(flat);
         let right = cross(forward, up);
@@ -384,6 +388,15 @@ mod tests {
         // Tilted 60 degrees towards upright: -Z would now be the likelier guess, but +Y stays.
         let m = process(&mut f, [0, 866, 500], [0, 1000, 0], [0; 3]);
         assert!(m.forward > 0.0, "{m:?}");
+    }
+
+    #[test]
+    fn started_flat_then_put_upright_still_reads_acceleration() {
+        let mut f = Fusion::new();
+        process(&mut f, FLAT, [0; 3], [0; 3]); // guesses +Y, which points up once the phone stands upright
+        let m = process(&mut f, UPRIGHT, [0, 0, -2000], [0; 3]);
+        assert!(approx(m.forward, 2.0), "{m:?}");
+        assert!(matches!(f.forward_state(), ForwardState::Guessing { .. }));
     }
 
     // ---- learning forward from a simulated drive ----

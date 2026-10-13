@@ -6,6 +6,7 @@ Desktop (Wayland/Hyprland) half of a "vehicle motion cues" tool: a particle-styl
 
 ## Commands
 - `cargo run` (follows the phone over Bluetooth), `cargo run -- --no-phone` (at rest) or `cargo run -- tests/data/drive.csv` (replay) — overlay on every monitor (needs a live Wayland session with wlr-layer-shell); Ctrl+C to stop. `--config FILE` overrides `~/.config/ams-dots/config.toml`.
+- `--record FILE` writes every received sample (raw phone values and the fused forward/lateral/yaw) as CSV (`motion::RECORDING_HEADER`); the first thing to ask for when the dots misbehave on a drive
 - `cargo test` — all unit tests; `cargo test spring` or `cargo test dots_flow_with_the_felt_inertia` runs a subset by name
 - `ams-dots-linux status [--watch]` / `phones` / `select [N|NAME|any]` / `forget` / `connect` / `disconnect` / `relearn` — talk to the running overlay via `$XDG_RUNTIME_DIR/ams-dots.sock`; `--pick` forces the start-up phone list
 - `hyprctl layers` — verify the `ams-dots` surface is on the overlay level
