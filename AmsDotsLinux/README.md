@@ -16,7 +16,8 @@ Bluetooth) lives in `../AmsDotsMobileController`.
 | TOML configuration | done |
 | Mock motion from a CSV recording | done |
 | Receiving real phone data over Bluetooth, converted to vehicle axes | done, tried on a real phone (13 packets/s, no loss) |
-| Pick the phone from a list at start-up | done |
+| Pick the phone from a list the first time; later runs connect to the last phone by themselves | done |
+| `phones`, `select`, `forget`: list and switch phones while the overlay runs | done |
 | Automatic "forward" direction (learned from driving, no calibration step) | done (simulated drives; not yet tried in a car) |
 | `status`, `connect`, `disconnect` commands, desktop notifications | done |
 
@@ -34,8 +35,8 @@ install the app, open it and press **Start** ("Waiting for the laptop").
 cargo run --release
 ```
 
-The first build takes a minute. The app scans for 4 seconds and lists the phones
-that run the AmsDots app:
+The first build takes a minute. **The first time** the app scans for 4 seconds
+and lists the phones that run the AmsDots app:
 
 ```
   [1] Redmi Note 12 Pro 5G          -60 dBm  6D:1E:7C:C1:40:1C <- Enter
@@ -43,9 +44,22 @@ number or Enter to connect, r = rescan, a = first phone that appears, q = quit:
 ```
 
 Type the number (or Enter for the one marked), and the dots start following that
-phone. The choice is remembered (`~/.local/state/ams-dots/phone`), so next time
-Enter is enough. A notification says "connected, receiving motion". Stop with
-Ctrl+C; that also disconnects the phone cleanly.
+phone. **From then on it connects to that phone by itself, with no question**:
+the last phone chosen or connected is remembered in
+`~/.local/state/ams-dots/phone`. A notification says "connected, receiving
+motion". Stop with Ctrl+C; that also disconnects the phone cleanly.
+
+**To use another phone**, while the overlay runs (second terminal):
+
+```sh
+ams-dots-linux phones          # phones heard lately, marking the connected and the last one
+ams-dots-linux select          # shows the list and asks which one
+ams-dots-linux select 2        # or by number from `phones`, by name, or `any`
+ams-dots-linux forget          # forget the last phone: the next start asks again
+```
+
+or start with `--pick` to see the list at start-up even though a phone is
+remembered. `select` also remembers the new phone.
 
 **3. To watch the link** (second terminal, overlay still running):
 
@@ -74,20 +88,24 @@ Requires a Wayland compositor that supports `wlr-layer-shell` (Hyprland, sway,
 river, ...; GNOME does not).
 
 ```sh
-cargo run --release                      # pick a phone from the list, follow it over Bluetooth
+cargo run --release                      # follow the last phone over Bluetooth (first time: pick from a list)
+cargo run --release -- --pick            # always show the list of phones first
 cargo run --release -- --phone "Redmi Note 12 Pro 5G"   # skip the list (also `--phone any`)
 cargo run --release -- --no-phone        # vehicle at rest: dots shimmer in place
 cargo run --release -- tests/data/drive.csv   # replay a mock drive (loops every 30 s)
 cargo run --release -- --config my.toml  # use another config file
 cargo run --release -- --rate 30         # ask the phone for 30 Hz (10-100; its default is 50)
 cargo run --release -- status [--watch]  # what the running overlay sees
+cargo run --release -- phones | select [N|NAME|any] | forget   # list / switch / forget the phone
 cargo run --release -- connect | disconnect | relearn   # control the running overlay
 cargo test                               # unit tests (no Wayland, no Bluetooth needed)
 hyprctl layers                           # the overlay shows as namespace "ams-dots", level overlay
 ```
 
-Without a terminal (autostart) there is no list: the phone chosen last time is
-used, or the first one found if none was ever chosen.
+Without a terminal (autostart) there is never a list: the last phone is used, or
+the first one found if none was ever chosen (and that one is then remembered).
+If the last phone is not in range, the app keeps waiting for *that* phone and
+never grabs another one; `status` says `scanning for "NAME"`.
 
 Stop with Ctrl+C. Optional Hyprland rule to skip the open/close animation:
 
@@ -146,7 +164,8 @@ The file is read once at startup; restart to apply changes.
 
 The overlay follows the phone app (`../AmsDotsMobileController`): the app
 advertises the AmsDots service, the laptop lists the phones that do (picker, see
-Quick start), connects, subscribes and follows the one you chose. No pairing is
+Quick start; the first time only), connects, subscribes and follows the one you
+chose, or the last one it followed. No pairing is
 needed. Phones are told apart by their Bluetooth name, because the phone's
 random Bluetooth address changes every time its link is started. The receiver never
 gives up: if the phone leaves or the link drops, the dots settle (no motion
@@ -159,7 +178,11 @@ printed on stderr and shown as a desktop notification (`notify-send`), e.g.
 view in one line (link state, packets per second, loss, age of the newest
 packet, and the forward / lateral / yaw values the dots get), so shaking the phone
 shows immediately whether the link is responsive. `disconnect` drops the phone
-and stops scanning, `connect` starts again. The phone advertises four times a
+and stops scanning, `connect` starts again. `phones` lists what the receiver
+heard in the last 30 s (a connected phone does not advertise, so while one is
+connected the list holds that phone plus anything heard just before), and
+`select` points the receiver at another phone: the current session ends and a
+new one starts for the new phone, which must be advertising (app started). The phone advertises four times a
 second, so the laptop notices it within a moment. Measured on a real link, the
 newest packet is typically 10-40 ms old when the dots read it, plus up to 60 ms
 of packing on the phone and 40 ms of sensor batching; the spring then smooths it.
@@ -220,9 +243,9 @@ after conversion to the vehicle's frame.
 | `src/replay.rs` | Reads and plays back the CSV recording. |
 | `src/protocol.rs` | Phone packet decoder (tested against `protocol/vectors.txt`) and control command. |
 | `src/fusion.rs` | Phone axes to vehicle axes, and learning which way is forward. |
-| `src/picker.rs` | The start-up list of phones, the remembered choice, matching by name. |
+| `src/picker.rs` | The list of phones, the remembered last phone, the start-up decision (ask or connect), matching by name. |
 | `src/ble.rs` | BlueZ receiver thread: scan, connect, subscribe, reconnect, clean disconnect on exit. |
-| `src/control.rs` | Unix socket for `status`, `connect`, `disconnect`, `relearn`. |
+| `src/control.rs` | Unix socket for `status`, `phones`, `select`, `forget`, `connect`, `disconnect`, `relearn`. |
 | `src/spring.rs` | The damped spring that smooths the motion. |
 | `src/particles.rs` | The dot generator: spawning, ageing, drift, size over life. No drawing. |
 | `src/dots.rs` | Paints a list of dots into an image. No Wayland. |
@@ -284,6 +307,10 @@ picture. Terms used in `overlay.rs`:
 
 ## Troubleshooting
 
+- **`scanning for "NAME"` never ends.** The last phone is not advertising: start
+  the app on it, or run `ams-dots-linux phones` to see what is in range and
+  `ams-dots-linux select` to follow another phone. After 10 s the log names the
+  other phones in range.
 - **The list is empty / "scanning for the phone" never ends.** Is the phone app
   at "Waiting for the laptop"? Is the phone's screen on and Bluetooth on? If
   `bluetoothctl devices Connected` still lists the phone from an earlier run

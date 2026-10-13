@@ -29,7 +29,7 @@ adb shell am start -n com.amsdots/.MainActivity
 On the phone: press **Start** and allow the Bluetooth and notification
 permissions it asks for (the first press asks, press Start again after allowing).
 The screen then says "Waiting for the laptop"; start the overlay on the laptop
-(`../AmsDotsLinux/README.md`, Quick start) and pick this phone from its list. The
+(`../AmsDotsLinux/README.md`, Quick start); the first time pick this phone from its list, afterwards the laptop reconnects to it by itself. The
 screen changes to "Streaming" with the achieved sample rate. **Stop** (or the
 notification's Stop action) ends it. Keep the screen on while testing; on Xiaomi
 phones set the app to "No restrictions" in battery settings and enable Autostart,

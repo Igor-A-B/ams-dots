@@ -12,20 +12,22 @@ mod replay;
 mod spring;
 
 use motion::{Live, MotionSource};
-use picker::Target;
+use picker::Startup;
 use std::io::IsTerminal;
 use std::time::Duration;
 
 const USAGE: &str = "\
 usage: ams-dots-linux [options] [recording.csv]
-       ams-dots-linux status [--watch] | connect | disconnect | relearn
+       ams-dots-linux status [--watch] | phones | select [N|NAME|any] | forget | connect | disconnect | relearn
 
-Starts the overlay. It scans for phones running the AmsDots app, asks which one
-to follow, and shows dots that move with the phone. The other commands talk to
+Starts the overlay and shows dots that move with the phone running the AmsDots
+app. The first time it lists the phones in range and asks which one to follow;
+after that it connects to the last phone by itself. The other commands talk to
 an overlay that is already running (from a second terminal).
 
 options:
   --phone NAME   follow the phone with this Bluetooth name, or `any`; no question asked
+  --pick         list the phones and ask, even if a last phone is remembered
   --rate HZ      ask the phone to sample at HZ (10-100; its default is 50)
   --config FILE  use another config file (default ~/.config/ams-dots/config.toml)
   --no-phone     no Bluetooth: dots stay at rest
@@ -35,6 +37,9 @@ options:
 commands:
   status           link state, phone, packet rate, forward direction
   status --watch   the same as one live line (shake the phone and watch it move)
+  phones           phones heard lately (numbered), marking the connected and the last one
+  select           switch phone: shows the list and asks; or `select 2`, `select NAME`, `select any`
+  forget           forget the last phone (the next start asks again)
   connect          start looking for the phone again
   disconnect       drop the phone and stop looking until `connect`
   relearn          forget the learned forward direction (after moving the phone)";
@@ -55,15 +60,23 @@ fn start() -> Result<(), String> {
     let mut phone_name: Option<String> = None;
     let mut rate_hz: Option<u8> = None;
     let mut use_phone = true;
+    let mut pick = false;
 
     let mut args = std::env::args().skip(1).peekable();
-    if let Some(command @ ("status" | "connect" | "disconnect" | "relearn")) = args.peek().map(String::as_str) {
+    if let Some(command @ ("status" | "phones" | "select" | "forget" | "connect" | "disconnect" | "relearn")) =
+        args.peek().map(String::as_str)
+    {
         let command = command.to_string();
         args.next();
-        if command == "status" && args.peek().map(String::as_str) == Some("--watch") {
+        let rest: Vec<String> = args.collect();
+        if command == "status" && rest.first().map(String::as_str) == Some("--watch") {
             return control::watch();
         }
-        println!("{}", control::send(&command)?);
+        if command == "select" && rest.is_empty() && std::io::stdin().is_terminal() {
+            println!("{}", control::select_interactive()?);
+            return Ok(());
+        }
+        println!("{}", control::send(&format!("{command} {}", rest.join(" ")))?);
         return Ok(());
     }
     while let Some(arg) = args.next() {
@@ -82,6 +95,7 @@ fn start() -> Result<(), String> {
                 }
                 rate_hz = Some(hz);
             }
+            "--pick" => pick = true,
             "--no-phone" => use_phone = false,
             _ if arg.starts_with('-') => return Err(format!("unknown option {arg}\n\n{USAGE}")),
             _ => recording_path = Some(arg),
@@ -92,12 +106,14 @@ fn start() -> Result<(), String> {
     let motion = match recording_path {
         Some(path) => MotionSource::Replay(replay::load(&path)?),
         None if use_phone => {
-            let Some(target) = choose_target(phone_name)? else { return Ok(()) };
+            let Some((target, remember)) = choose_target(phone_name, pick)? else { return Ok(()) };
             eprintln!("ams-dots: following {}. Stop with Ctrl+C.", target.describe());
+            eprintln!("ams-dots: to change phone while it runs:  ams-dots-linux select   (list: ams-dots-linux phones)");
             let exe = std::env::current_exe().map_or_else(|_| "ams-dots-linux".to_string(), |p| p.display().to_string());
             eprintln!("ams-dots: to watch the link, run in another terminal:  {exe} status --watch");
             let live = Live::new();
-            ble::spawn(live.clone(), rate_hz, target);
+            live.set_target(target);
+            ble::spawn(live.clone(), rate_hz, remember);
             ble::disconnect_on_exit(live.clone());
             MotionSource::Live(live)
         }
@@ -106,21 +122,22 @@ fn start() -> Result<(), String> {
     overlay::run(config, motion)
 }
 
-/// Decides which phone to follow: the one named on the command line, the one the user picks from the
-/// list of phones in range, or (without a terminal to ask on) the one chosen last time. `None` = the user quit.
-fn choose_target(phone_name: Option<String>) -> Result<Option<Target>, String> {
-    if let Some(name) = phone_name {
-        return Ok(Some(if name == "any" { Target::any() } else { Target::named(&name) }));
-    }
-    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
-        return Ok(Some(picker::remembered().map_or_else(Target::any, |name| Target::named(&name))));
-    }
+/// Decides which phone to follow, and whether to store the phone that connects as the last known one.
+/// A phone chosen before (or `--phone`) is used without a question; with none remembered the user picks from
+/// the list of phones in range (or, without a terminal to ask on, the first one found is used).
+/// `None` = the user quit.
+fn choose_target(phone_name: Option<String>, pick: bool) -> Result<Option<(picker::Target, bool)>, String> {
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let last = picker::remembered();
-    picker::ask(
-        last.as_deref(),
-        picker::remember,
-        || ble::scan(PICKER_SCAN),
-        &mut std::io::stdin().lock(),
-        &mut std::io::stdout(),
-    )
+    match picker::startup(phone_name.as_deref(), pick, last.as_deref(), interactive)? {
+        Startup::Follow { target, remember } => Ok(Some((target, remember))),
+        Startup::Ask => Ok(picker::ask(
+            last.as_deref(),
+            picker::remember,
+            || ble::scan(PICKER_SCAN),
+            &mut std::io::stdin().lock(),
+            &mut std::io::stdout(),
+        )?
+        .map(|target| (target, true))),
+    }
 }

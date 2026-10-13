@@ -1,9 +1,11 @@
 //! Choosing which phone to follow.
 //!
-//! On start the overlay scans for a few seconds and lists the phones that run
-//! the AmsDots app, then asks which one to use. The choice is remembered, so
-//! next time Enter is enough. Without a terminal (autostart) or with
-//! `--phone NAME`, nothing is asked.
+//! The first time (nothing remembered) the overlay scans for a few seconds,
+//! lists the phones that run the AmsDots app and asks which one to use. From
+//! then on it connects to the last phone by itself, without asking: the phone
+//! that was chosen or connected last is remembered. `--pick` asks again, and
+//! `ams-dots-linux select` switches phone while the overlay runs. Without a
+//! terminal (autostart) or with `--phone NAME`, nothing is asked.
 //!
 //! Phones are told apart by their Bluetooth name, not their address: the phone
 //! advertises with a random address that changes every time the app starts its
@@ -81,29 +83,114 @@ pub fn parse_choice(input: &str, count: usize, default: Option<usize>) -> Option
     }
 }
 
-/// Where the last choice is stored (`$XDG_STATE_HOME/ams-dots/phone`, default `~/.local/state/ams-dots/phone`).
-fn remembered_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
-    Some(base.join("ams-dots").join("phone"))
+/// Where the last phone is kept between runs.
+pub trait PhoneMemory {
+    fn get(&self) -> Option<String>;
+    fn set(&self, name: &str);
+    fn forget(&self);
 }
 
-/// The phone chosen last time, if any.
-pub fn remembered() -> Option<String> {
-    let text = std::fs::read_to_string(remembered_path()?).ok()?;
-    let name = text.trim();
-    (!name.is_empty()).then(|| name.to_string())
+/// The phone is remembered in a one-line file.
+pub struct FileMemory(Option<PathBuf>);
+
+impl FileMemory {
+    /// `$XDG_STATE_HOME/ams-dots/phone`, default `~/.local/state/ams-dots/phone`.
+    pub fn default_location() -> Self {
+        let base = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")));
+        Self(base.map(|b| b.join("ams-dots").join("phone")))
+    }
+
+    #[cfg(test)]
+    pub fn at(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
 }
 
-/// Stores the choice for next time. Failing to store it is not worth interrupting the user for.
-pub fn remember(name: &str) {
-    if let Some(path) = remembered_path() {
+impl PhoneMemory for FileMemory {
+    fn get(&self) -> Option<String> {
+        let text = std::fs::read_to_string(self.0.as_ref()?).ok()?;
+        let name = text.trim();
+        (!name.is_empty()).then(|| name.to_string())
+    }
+
+    /// Failing to store it is not worth interrupting the user for.
+    fn set(&self, name: &str) {
+        let Some(path) = &self.0 else { return };
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
         let _ = std::fs::write(path, format!("{name}\n"));
     }
+
+    fn forget(&self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// The phone chosen or connected last time, if any.
+pub fn remembered() -> Option<String> {
+    FileMemory::default_location().get()
+}
+
+/// Stores the phone for next time.
+pub fn remember(name: &str) {
+    FileMemory::default_location().set(name);
+}
+
+/// What the overlay does about the phone when it starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Startup {
+    /// Go: follow this phone. `remember` = store whichever phone connects as the last known one.
+    Follow { target: Target, remember: bool },
+    /// Show the list and let the user choose.
+    Ask,
+}
+
+/// Decides the start-up behaviour. `explicit` is `--phone`, `pick` is `--pick`, `remembered` the last phone,
+/// `interactive` whether there is a terminal to ask on. Remembered phones connect without a question.
+pub fn startup(explicit: Option<&str>, pick: bool, remembered: Option<&str>, interactive: bool) -> Result<Startup, String> {
+    if let Some(name) = explicit {
+        let target = if name == "any" { Target::any() } else { Target::named(name) };
+        return Ok(Startup::Follow { target, remember: false });
+    }
+    if pick {
+        return if interactive { Ok(Startup::Ask) } else { Err("--pick needs a terminal to ask on".to_string()) };
+    }
+    Ok(match (remembered, interactive) {
+        (Some(name), _) => Startup::Follow { target: Target::named(name), remember: true },
+        (None, true) => Startup::Ask,
+        (None, false) => Startup::Follow { target: Target::any(), remember: true },
+    })
+}
+
+/// One phone per line, `name<TAB>address<TAB>rssi` (empty when unknown): how the overlay hands its list
+/// of phones to `ams-dots-linux select`.
+pub fn to_lines(candidates: &[Candidate]) -> String {
+    let clean = |text: &str| text.replace(['\t', '\n'], " ");
+    candidates
+        .iter()
+        .map(|c| format!("{}\t{}\t{}", clean(c.name.as_deref().unwrap_or("")), c.address, c.rssi.map_or(String::new(), |r| r.to_string())))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Reads what [`to_lines`] wrote. Lines that do not fit are skipped.
+pub fn from_lines(text: &str) -> Vec<Candidate> {
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let (name, address, rssi) = (parts.next()?, parts.next()?, parts.next()?);
+            Some(Candidate {
+                name: (!name.is_empty()).then(|| name.to_string()),
+                address: address.to_string(),
+                rssi: rssi.parse().ok(),
+            })
+        })
+        .collect()
 }
 
 /// Prints the list. Returns the index Enter should pick.
@@ -277,6 +364,66 @@ mod tests {
         let list = vec![phone("Pixel", -50)];
         assert_eq!(ask(None, |_| {}, || Ok(list.clone()), &mut Cursor::new("q\n"), &mut Vec::new()).unwrap(), None);
         assert_eq!(ask(None, |_| {}, || Ok(list.clone()), &mut Cursor::new(""), &mut Vec::new()).unwrap(), None);
+    }
+
+    fn temp_file(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("ams-dots-test-{}-{tag}", std::process::id())).join("phone")
+    }
+
+    #[test]
+    fn the_file_memory_stores_and_forgets_a_name() {
+        let path = temp_file("memory");
+        let memory = FileMemory::at(path.clone());
+        assert_eq!(memory.get(), None);
+        memory.set("Redmi Note 12 Pro 5G");
+        assert_eq!(memory.get().as_deref(), Some("Redmi Note 12 Pro 5G"));
+        memory.set("Pixel");
+        assert_eq!(memory.get().as_deref(), Some("Pixel"));
+        memory.forget();
+        assert_eq!(memory.get(), None);
+        memory.forget(); // forgetting nothing is fine
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_remembered_phone_connects_without_asking() {
+        let follow = |name: &str| Startup::Follow { target: Target::named(name), remember: true };
+        assert_eq!(startup(None, false, Some("Pixel"), true), Ok(follow("Pixel")));
+        assert_eq!(startup(None, false, Some("Pixel"), false), Ok(follow("Pixel")));
+    }
+
+    #[test]
+    fn nothing_remembered_asks_on_a_terminal_and_takes_any_phone_without_one() {
+        assert_eq!(startup(None, false, None, true), Ok(Startup::Ask));
+        assert_eq!(startup(None, false, None, false), Ok(Startup::Follow { target: Target::any(), remember: true }));
+    }
+
+    #[test]
+    fn pick_asks_even_when_a_phone_is_remembered_but_needs_a_terminal() {
+        assert_eq!(startup(None, true, Some("Pixel"), true), Ok(Startup::Ask));
+        assert!(startup(None, true, Some("Pixel"), false).is_err());
+    }
+
+    #[test]
+    fn an_explicit_phone_wins_and_is_not_remembered() {
+        let explicit = |target| Ok(Startup::Follow { target, remember: false });
+        assert_eq!(startup(Some("Redmi"), true, Some("Pixel"), true), explicit(Target::named("Redmi")));
+        assert_eq!(startup(Some("any"), false, Some("Pixel"), false), explicit(Target::any()));
+    }
+
+    #[test]
+    fn the_line_format_round_trips() {
+        let list = vec![
+            phone("Pixel", -50),
+            Candidate { name: None, address: "11:22:33:44:55:66".to_string(), rssi: None },
+            Candidate { name: Some("Odd\tname".to_string()), address: "A".to_string(), rssi: Some(-7) },
+        ];
+        let back = from_lines(&to_lines(&list));
+        assert_eq!(back[0], list[0]);
+        assert_eq!(back[1], list[1]);
+        assert_eq!(back[2].name.as_deref(), Some("Odd name"));
+        assert_eq!(from_lines(&to_lines(&[])), vec![]);
+        assert_eq!(from_lines("garbage without tabs"), vec![]);
     }
 
     #[test]
