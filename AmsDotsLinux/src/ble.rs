@@ -17,9 +17,7 @@
 //! earlier scan do not. The chosen phone is recognised by its Bluetooth name.
 //! Everything heard is also reported to [`Live`] for the `phones` command.
 //!
-//! Feedback: every change of the link is printed on stderr and shown as a
-//! desktop notification (`notify-send`, if installed), so you see that the two
-//! apps found each other without looking at a terminal.
+//! Feedback: every change of the link is printed on stderr.
 
 use crate::control;
 use crate::motion::{LinkState, Live};
@@ -144,15 +142,9 @@ pub fn disconnect_on_exit(live: Arc<Live>) {
     });
 }
 
-/// Prints a message and, if possible, shows it as a desktop notification.
+/// Reports a change of the link on stderr.
 fn announce(message: &str) {
     eprintln!("ams-dots: {message}");
-    // Fire and forget: no notification daemon or no notify-send just means no popup.
-    let _ = tokio::process::Command::new("notify-send")
-        .args(["--app-name=AmsDots", "--expire-time=3000", "AmsDots", message])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
 }
 
 /// Resolves when the user turns the receiver off (`disconnect`) or picks another phone (`select`, which

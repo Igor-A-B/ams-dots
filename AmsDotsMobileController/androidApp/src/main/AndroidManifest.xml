@@ -13,6 +13,10 @@
     <!-- Foreground service that keeps the link and sensors alive with the screen off. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- Optional, debug only: GPS speed on the screen, also with the screen off. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Only held while streaming when the phone lacks wake-up sensors; see MotionService. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -37,7 +41,7 @@
         <service
             android:name="com.amsdots.android.MotionService"
             android:exported="false"
-            android:foregroundServiceType="connectedDevice" />
+            android:foregroundServiceType="connectedDevice|location" />
     </application>
 
 </manifest>

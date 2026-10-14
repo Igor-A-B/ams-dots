@@ -11,6 +11,9 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.location.Location
+import android.location.LocationListener
+import android.location.LocationManager
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
@@ -21,7 +24,9 @@ import com.amsdots.stream.LinkPhase
 import com.amsdots.stream.LinkStatus
 import com.amsdots.stream.MotionStreamer
 import com.amsdots.stream.RateMeter
+import com.amsdots.stream.ReadoutMeter
 import com.amsdots.stream.SensorFuser
+import com.amsdots.stream.SpeedMeter
 
 /**
  * Foreground service (type `connectedDevice`) that owns the whole phone side:
@@ -43,6 +48,9 @@ class MotionService : Service(), PeripheralEvents {
     private lateinit var streamer: MotionStreamer
     private lateinit var peripheral: GattPeripheral
     private val meter = RateMeter()
+    private val readouts = ReadoutMeter()
+    private val speeds = SpeedMeter()
+    private var locating = false
 
     private var wakeLock: PowerManager.WakeLock? = null
     private var started = false
@@ -63,6 +71,12 @@ class MotionService : Service(), PeripheralEvents {
         peripheral.notificationSentListener = { streamer.onNotificationSent() }
         fuser = SensorFuser { sample ->
             meter.add(sample.timeNs)
+            val s = sample.sample
+            readouts.add(
+                doubleArrayOf(s.acceleration.x / 1000.0, s.acceleration.y / 1000.0, s.acceleration.z / 1000.0),
+                doubleArrayOf(s.rotation.x / 1000.0, s.rotation.y / 1000.0, s.rotation.z / 1000.0),
+                doubleArrayOf(sample.gravityMg.x.toDouble(), sample.gravityMg.y.toDouble(), sample.gravityMg.z.toDouble()),
+            )
             if (!sensorTest) streamer.onSample(sample)
         }
         sensors = MotionSensors(this, handler, fuser)
@@ -92,7 +106,7 @@ class MotionService : Service(), PeripheralEvents {
         unregisterReceiver(bluetoothState)
         handler.post { teardown() }
         thread.quitSafely()
-        ServiceState.update { it.copy(phase = if (it.error != null) LinkPhase.ERROR else LinkPhase.STOPPED, measured = null, packetsSent = 0) }
+        ServiceState.update { it.copy(phase = if (it.error != null) LinkPhase.ERROR else LinkPhase.STOPPED, measured = null, packetsSent = 0, readout = null, speed = null) }
         super.onDestroy()
     }
 
@@ -104,6 +118,7 @@ class MotionService : Service(), PeripheralEvents {
         val missingPermissions = RequiredPermissions.missing(this)
         if (missingPermissions.isNotEmpty() && !sensorTest) return shutdown("Missing permission: ${missingPermissions.first().substringAfterLast('.')}")
 
+        startLocation()
         if (sensorTest) {
             setPhase(LinkPhase.SENSOR_TEST)
             startSensors()
@@ -114,6 +129,7 @@ class MotionService : Service(), PeripheralEvents {
     }
 
     private fun teardown() {
+        stopLocation()
         stopSensors()
         peripheral.stop()
         streamer.reset()
@@ -176,6 +192,7 @@ class MotionService : Service(), PeripheralEvents {
     private fun startSensors() {
         fuser.reset()
         meter.reset()
+        readouts.reset()
         sensors.start(rateHz)
         sensorsOn = true
         // Plain (non-wake-up) sensors stop delivering when the CPU suspends, so hold it awake instead.
@@ -187,12 +204,16 @@ class MotionService : Service(), PeripheralEvents {
         }
         handler.removeCallbacks(reportRate)
         handler.postDelayed(reportRate, REPORT_INTERVAL_MS)
+        handler.removeCallbacks(reportReadout)
+        handler.postDelayed(reportReadout, READOUT_INTERVAL_MS)
     }
 
     private fun stopSensors() {
         sensors.stop()
         sensorsOn = false
         handler.removeCallbacks(reportRate)
+        handler.removeCallbacks(reportReadout)
+        ServiceState.update { it.copy(readout = null) }
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
     }
@@ -211,6 +232,44 @@ class MotionService : Service(), PeripheralEvents {
         }
     }
 
+    /** A few times a second: the debug figures on the screen (and in the log with the rate). */
+    private val reportReadout = object : Runnable {
+        override fun run() {
+            val readout = readouts.report()
+            readouts.reset()
+            ServiceState.update { it.copy(readout = readout) }
+            if (sensorsOn) handler.postDelayed(this, READOUT_INTERVAL_MS)
+        }
+    }
+
+    // --- GPS speed (debug figure only; nothing is sent to the laptop) ---
+
+    private fun startLocation() {
+        val manager = getSystemService(LocationManager::class.java)
+        if (!RequiredPermissions.hasLocation(this) || !manager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
+            Log.i(TAG, "no location permission or GPS off: speed not shown")
+            return
+        }
+        speeds.reset()
+        try {
+            manager.requestLocationUpdates(LocationManager.GPS_PROVIDER, LOCATION_INTERVAL_MS, 0f, locationListener, thread.looper)
+            locating = true
+        } catch (e: SecurityException) {
+            Log.w(TAG, "location refused: ${e.message}")
+        }
+    }
+
+    private fun stopLocation() {
+        if (locating) getSystemService(LocationManager::class.java).removeUpdates(locationListener)
+        locating = false
+    }
+
+    private val locationListener = LocationListener { location: Location ->
+        if (!location.hasSpeed()) return@LocationListener
+        val speed = speeds.add(location.elapsedRealtimeNanos, location.speed.toDouble(), if (location.hasAccuracy()) location.accuracy.toDouble() else null)
+        ServiceState.update { it.copy(speed = speed) }
+    }
+
     // --- status and notification ---
 
     private fun setPhase(phase: LinkPhase) {
@@ -221,7 +280,10 @@ class MotionService : Service(), PeripheralEvents {
     private fun enterForeground(phase: LinkPhase) {
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(NotificationChannel(CHANNEL_ID, "AmsDots link", NotificationManager.IMPORTANCE_LOW))
-        startForeground(NOTIFICATION_ID, notification(phase), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        // The location type is needed to read GPS speed with the screen off; only allowed once the permission is granted.
+        val type = ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE or
+            (if (RequiredPermissions.hasLocation(this)) ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION else 0)
+        startForeground(NOTIFICATION_ID, notification(phase), type)
     }
 
     private fun notification(phase: LinkPhase): Notification {
@@ -263,6 +325,8 @@ class MotionService : Service(), PeripheralEvents {
         private const val NOTIFICATION_ID = 1
         private const val DEFAULT_MTU = 23
         private const val REPORT_INTERVAL_MS = 5_000L
+        private const val READOUT_INTERVAL_MS = 250L
+        private const val LOCATION_INTERVAL_MS = 1_000L
         private const val MAX_WAKE_LOCK_MS = 6 * 60 * 60 * 1000L
 
         /** Starts the service; the caller must already hold the runtime permissions ([RequiredPermissions]). */

@@ -27,6 +27,8 @@ enum class LinkPhase {
  * @property targetRateHz sample rate currently requested of the sensors
  * @property measured achieved rate and jitter of the last window, if sensors are on
  * @property packetsSent notifications sent since the laptop subscribed
+ * @property readout acceleration and rotation over the last fraction of a second, while the sensors run
+ * @property speed latest GPS speed, while the service runs and location is allowed
  */
 data class LinkStatus(
     val phase: LinkPhase = LinkPhase.STOPPED,
@@ -34,6 +36,8 @@ data class LinkStatus(
     val measured: RateReport? = null,
     val packetsSent: Long = 0,
     val error: String? = null,
+    val readout: MotionReadout? = null,
+    val speed: SpeedReadout? = null,
 ) {
     val running: Boolean get() = phase != LinkPhase.STOPPED && phase != LinkPhase.ERROR
 

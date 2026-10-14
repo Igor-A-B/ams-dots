@@ -11,6 +11,7 @@ use crate::fusion::{ForwardState, Fusion, Motion};
 use crate::picker::{Candidate, Target};
 use crate::protocol::Packet;
 use crate::replay::{self, Sample};
+use std::io::Write;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -80,6 +81,23 @@ pub struct PushOutcome {
     pub lost: u16,
     /// The forward direction was learned (or its confirmation changed) with this packet.
     pub forward_learned: Option<ForwardState>,
+}
+
+/// Columns of a `--record` file: the packet's sequence, the sample's time (ms, phone clock), the raw phone
+/// values exactly as received (gravity milli-g, acceleration mm/s², rotation mrad/s, phone axes) and the
+/// fusion's output (m/s², rad/s).
+pub const RECORDING_HEADER: &str = "seq,t_ms,grav_x,grav_y,grav_z,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,forward,lateral,yaw\n";
+
+fn recording_row(packet: &Packet, index: usize, dt: f32, m: Motion) -> String {
+    let s = &packet.samples[index];
+    let t_ms = f64::from(packet.first_sample_ms) + index as f64 * f64::from(dt) * 1000.0;
+    let [gx, gy, gz] = packet.gravity_mg;
+    let [ax, ay, az] = s.accel_mm_s2;
+    let [wx, wy, wz] = s.gyro_mrad_s;
+    format!(
+        "{},{t_ms:.0},{gx},{gy},{gz},{ax},{ay},{az},{wx},{wy},{wz},{:.3},{:.3},{:.3}\n",
+        packet.sequence, m.forward, m.lateral, m.yaw
+    )
 }
 
 /// Everything `status` reports.
@@ -173,6 +191,8 @@ struct Inner {
     lost: u64,
     /// Seconds between packets, smoothed.
     interval: Option<f32>,
+    /// `--record`: every received sample and what the fusion made of it, as CSV.
+    recording: Option<Box<dyn Write + Send>>,
 }
 
 /// The newest motion from the phone, shared between the Bluetooth thread
@@ -202,6 +222,7 @@ impl Live {
                 packets: 0,
                 lost: 0,
                 interval: None,
+                recording: None,
             }),
             toggled: Notify::new(),
         })
@@ -231,8 +252,17 @@ impl Live {
         inner.previous = Some((packet.first_sample_ms, packet.samples.len()));
 
         let before = inner.fusion.forward_state();
-        for sample in &packet.samples {
+        for (i, sample) in packet.samples.iter().enumerate() {
             inner.latest = inner.fusion.process(packet.gravity_mg, sample, dt);
+            let row = recording_row(packet, i, dt, inner.latest);
+            if let Some(out) = inner.recording.as_mut() {
+                if out.write_all(row.as_bytes()).is_err() {
+                    inner.recording = None;
+                }
+            }
+        }
+        if let Some(out) = inner.recording.as_mut() {
+            let _ = out.flush();
         }
         let after = inner.fusion.forward_state();
 
@@ -250,6 +280,14 @@ impl Live {
             _ => None,
         };
         PushOutcome { lost, forward_learned }
+    }
+
+    /// `--record`: from now on, writes every sample to `out` as CSV ([`RECORDING_HEADER`]).
+    pub fn record_to(&self, mut out: Box<dyn Write + Send>) -> std::io::Result<()> {
+        out.write_all(RECORDING_HEADER.as_bytes())?;
+        out.flush()?;
+        self.lock().recording = Some(out);
+        Ok(())
     }
 
     /// The Bluetooth thread reports where the link stands. Anything but `Connected` means no motion.

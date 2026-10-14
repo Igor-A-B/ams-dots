@@ -19,7 +19,7 @@ Bluetooth) lives in `../AmsDotsMobileController`.
 | Pick the phone from a list the first time; later runs connect to the last phone by themselves | done |
 | `phones`, `select`, `forget`: list and switch phones while the overlay runs | done |
 | Automatic "forward" direction (learned from driving, no calibration step) | done (simulated drives; not yet tried in a car) |
-| `status`, `connect`, `disconnect` commands, desktop notifications | done |
+| `status`, `connect`, `disconnect` commands, link messages on stderr | done |
 
 ## Quick start
 
@@ -46,7 +46,7 @@ number or Enter to connect, r = rescan, a = first phone that appears, q = quit:
 Type the number (or Enter for the one marked), and the dots start following that
 phone. **From then on it connects to that phone by itself, with no question**:
 the last phone chosen or connected is remembered in
-`~/.local/state/ams-dots/phone`. A notification says "connected, receiving
+`~/.local/state/ams-dots/phone`. The terminal says "connected, receiving
 motion". Stop with Ctrl+C; that also disconnects the phone cleanly.
 
 **To use another phone**, while the overlay runs (second terminal):
@@ -173,7 +173,7 @@ means a vehicle at rest) and it scans again. Messages go to stderr. BlueZ must
 be running with a powered adapter (`systemctl status bluetooth`).
 
 **Interactive.** The overlay tells you what the link is doing: every change is
-printed on stderr and shown as a desktop notification (`notify-send`), e.g.
+printed on stderr, e.g.
 "phone connected, receiving motion". `ams-dots-linux status --watch` is a live
 view in one line (link state, packets per second, loss, age of the newest
 packet, and the forward / lateral / yaw values the dots get), so shaking the phone

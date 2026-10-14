@@ -31,7 +31,8 @@ class MainActivity : ComponentActivity() {
                 status = status,
                 onStart = { sensorTest ->
                     pendingSensorTest = sensorTest
-                    val missing = RequiredPermissions.missing(this)
+                    val missing = RequiredPermissions.missing(this) +
+                        listOfNotNull(RequiredPermissions.LOCATION.takeUnless { RequiredPermissions.hasLocation(this) })
                     if (missing.isEmpty()) MotionService.start(this, sensorTest) else askPermissions.launch(missing.toTypedArray())
                 },
                 onStop = { MotionService.stop(this) },

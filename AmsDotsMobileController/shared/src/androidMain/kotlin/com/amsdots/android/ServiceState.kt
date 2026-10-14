@@ -31,4 +31,9 @@ object RequiredPermissions {
 
     fun missing(context: Context): List<String> =
         all().filter { context.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+
+    /** Optional: only for the GPS speed shown on the screen. Asked together with the required ones. */
+    const val LOCATION = Manifest.permission.ACCESS_FINE_LOCATION
+
+    fun hasLocation(context: Context): Boolean = context.checkSelfPermission(LOCATION) == PackageManager.PERMISSION_GRANTED
 }
