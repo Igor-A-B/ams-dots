@@ -35,7 +35,7 @@ class GoldenVectorsTest {
     @Test
     fun validVectorsDecodeToTheDocumentedValuesAndEncodeBack() {
         val valid = load().filter { it.kind == "vector" }
-        assertTrue(valid.size >= 3, "expected at least three valid vectors")
+        assertTrue(valid.size >= 7, "expected at least seven valid vectors")
         for (v in valid) {
             val wire = bytes(v.one("hex"))
             val decoded = PacketCodec.decode(wire)
@@ -45,14 +45,21 @@ class GoldenVectorsTest {
             assertEquals(Vec3(g[0], g[1], g[2]), decoded.gravityMg, v.name)
             val expected = v.all("sample").map { ints(it) }.map { MotionSample(Vec3(it[0], it[1], it[2]), Vec3(it[3], it[4], it[5])) }
             assertEquals(expected, decoded.samples, v.name)
-            assertContentEquals(wire, PacketCodec.encode(decoded), "${v.name}: re-encoding")
+            val speed = v.fields.firstOrNull { it.first == "speed_cm_s" }?.second
+            if (speed == null || speed == "none") {
+                assertEquals(null, decoded.speed, v.name)
+            } else {
+                assertEquals(SpeedFix(speed.toInt(), v.one("fix_age_ms").toInt()), decoded.speed, v.name)
+            }
+            // Only version 2 is ever sent, so only its vectors encode back to the same bytes.
+            if (wire[0].toInt() == 2) assertContentEquals(wire, PacketCodec.encode(decoded), "${v.name}: re-encoding")
         }
     }
 
     @Test
     fun invalidVectorsAreRejectedWithTheDocumentedError() {
         val invalid = load().filter { it.kind == "invalid" }
-        assertTrue(invalid.size >= 6, "expected at least six invalid vectors")
+        assertTrue(invalid.size >= 9, "expected at least nine invalid vectors")
         for (v in invalid) {
             val error = assertFailsWith<PacketFormatException>(v.name) { PacketCodec.decode(bytes(v.one("hex"))) }.error
             assertEquals(v.one("error").uppercase(), error.name, v.name)

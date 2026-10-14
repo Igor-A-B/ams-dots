@@ -11,6 +11,7 @@ use crate::fusion::{ForwardState, Fusion, Motion};
 use crate::picker::{Candidate, Target};
 use crate::protocol::Packet;
 use crate::replay::{self, Sample};
+use crate::speed::{Fix, SpeedAid, SpeedStatus};
 use std::io::Write;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -82,17 +83,19 @@ pub struct PushOutcome {
 
 /// Columns of a `--record` file: the packet's sequence, the sample's time (ms, phone clock), the raw phone
 /// values exactly as received (gravity milli-g, acceleration mm/s², rotation mrad/s, phone axes) and the
-/// fusion's output (m/s², rad/s).
-pub const RECORDING_HEADER: &str = "seq,t_ms,grav_x,grav_y,grav_z,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,forward,lateral,yaw\n";
+/// fusion's output (m/s², rad/s). `forward` already has the GPS correction; `gps_speed` (m/s, the newest fix
+/// in use) and `bias` (m/s² taken off the accelerometer) are empty while the phone sends no speed.
+pub const RECORDING_HEADER: &str = "seq,t_ms,grav_x,grav_y,grav_z,acc_x,acc_y,acc_z,gyro_x,gyro_y,gyro_z,forward,lateral,yaw,gps_speed,bias\n";
 
-fn recording_row(packet: &Packet, index: usize, dt: f32, m: Motion) -> String {
+fn recording_row(packet: &Packet, index: usize, dt: f32, m: Motion, gps: Option<SpeedStatus>) -> String {
     let s = &packet.samples[index];
     let t_ms = f64::from(packet.first_sample_ms) + index as f64 * f64::from(dt) * 1000.0;
     let [gx, gy, gz] = packet.gravity_mg;
     let [ax, ay, az] = s.accel_mm_s2;
     let [wx, wy, wz] = s.gyro_mrad_s;
+    let gps = gps.map_or(",".to_string(), |g| format!("{:.2},{:.3}", g.speed, g.bias));
     format!(
-        "{},{t_ms:.0},{gx},{gy},{gz},{ax},{ay},{az},{wx},{wy},{wz},{:.3},{:.3},{:.3}\n",
+        "{},{t_ms:.0},{gx},{gy},{gz},{ax},{ay},{az},{wx},{wy},{wz},{:.3},{:.3},{:.3},{gps}\n",
         packet.sequence, m.forward, m.lateral, m.yaw
     )
 }
@@ -112,6 +115,8 @@ pub struct Status {
     pub packets: u64,
     pub lost: u64,
     pub forward: ForwardState,
+    /// The phone's GPS speed and the correction it applies; `None` while the forward motion is the accelerometer alone.
+    pub gps: Option<SpeedStatus>,
 }
 
 impl Status {
@@ -136,6 +141,14 @@ impl Status {
         )
     }
 
+    /// What `status` says about where the forward acceleration comes from.
+    fn source_text(&self) -> String {
+        match self.gps {
+            Some(g) => format!("GPS speed {:.1} m/s ({:.0} km/h) guides it, accelerometer bias {:+.2} m/s2 removed", g.speed, g.speed * 3.6, -g.bias),
+            None => "accelerometer only (the phone sends no GPS speed)".to_string(),
+        }
+    }
+
     /// Several lines, for `status`.
     pub fn report(&self) -> String {
         let link = match self.link {
@@ -143,7 +156,7 @@ impl Status {
             other => other.text().to_string(),
         };
         format!(
-            "link:     {}\nphone:    {}\npackets:  {} received, {} lost, {:.1} per second\nmotion:   forward {:.2} m/s2, lateral {:.2} m/s2, yaw {:.2} rad/s\nforward:  {}",
+            "link:     {}\nphone:    {}\npackets:  {} received, {} lost, {:.1} per second\nmotion:   forward {:.2} m/s2, lateral {:.2} m/s2, yaw {:.2} rad/s\nforward:  {}\nspeed:    {}",
             link,
             self.phone.as_deref().unwrap_or("-"),
             self.packets,
@@ -153,6 +166,7 @@ impl Status {
             self.motion.lateral,
             self.motion.yaw,
             self.forward.text(),
+            self.source_text(),
         )
     }
 }
@@ -169,6 +183,8 @@ impl ForwardState {
 
 struct Inner {
     fusion: Fusion,
+    /// Corrects the forward acceleration with the phone's GPS speed, when there is one.
+    speed: SpeedAid,
     latest: Motion,
     last_packet: Option<Instant>,
     link: LinkState,
@@ -205,6 +221,7 @@ impl Live {
         Arc::new(Self {
             inner: Mutex::new(Inner {
                 fusion: Fusion::new(),
+                speed: SpeedAid::new(),
                 latest: Motion::default(),
                 last_packet: None,
                 link: LinkState::Scanning,
@@ -249,9 +266,13 @@ impl Live {
         inner.previous = Some((packet.first_sample_ms, packet.samples.len()));
 
         let before = inner.fusion.forward_state();
+        inner.speed.offer(packet.speed.map(|s| Fix { speed: s.speed(), time_ms: packet.first_sample_ms.wrapping_sub_signed(i32::from(s.age_ms)) }));
         for (i, sample) in packet.samples.iter().enumerate() {
-            inner.latest = inner.fusion.process(packet.gravity_mg, sample, dt);
-            let row = recording_row(packet, i, dt, inner.latest);
+            let mut motion = inner.fusion.process(packet.gravity_mg, sample, dt);
+            let sample_ms = packet.first_sample_ms.wrapping_add((i as f32 * dt * 1000.0).round() as u32);
+            motion.forward = inner.speed.process(sample_ms, motion.forward, dt);
+            inner.latest = motion;
+            let row = recording_row(packet, i, dt, motion, inner.speed.status());
             if let Some(out) = inner.recording.as_mut() {
                 if out.write_all(row.as_bytes()).is_err() {
                     inner.recording = None;
@@ -294,6 +315,7 @@ impl Live {
         inner.last_sequence = None;
         inner.previous = None;
         inner.interval = None;
+        inner.speed.reset();
         if link != LinkState::Connected {
             inner.latest = Motion::default();
             inner.last_packet = None;
@@ -388,7 +410,9 @@ impl Live {
 
     /// Forgets the learned forward direction (`relearn`).
     pub fn relearn(&self) {
-        self.lock().fusion.relearn();
+        let mut inner = self.lock();
+        inner.fusion.relearn();
+        inner.speed.reset(); // its speed estimate was integrated along the old forward direction
     }
 
     /// The motion to show at `now`: the newest sample, or zero while the phone is disconnected or silent.
@@ -413,6 +437,7 @@ impl Live {
             packets: inner.packets,
             lost: inner.lost,
             forward: inner.fusion.forward_state(),
+            gps: inner.speed.status(),
         }
     }
 }
@@ -428,6 +453,7 @@ mod tests {
             first_sample_ms: u32::from(sequence) * 80,
             gravity_mg: [0, 0, 1000],
             samples: vec![RawSample { accel_mm_s2: [0, accel_y, 0], gyro_mrad_s: [0; 3] }; 4],
+            speed: None,
         }
     }
 
@@ -531,6 +557,55 @@ mod tests {
         let seq = learned_at.expect("learned");
         // 5 s at 160 ms per packet is 31.25 packets.
         assert!((31..=35).contains(&seq), "learned after packet {seq}");
+    }
+
+    /// A packet whose speed is the same fix as long as it lasts: one fix a second, `speed_cm_s` each time.
+    fn packet_with_speed(sequence: u16, accel_y: i16, speed_cm_s: u16) -> Packet {
+        let plain = packet(sequence, accel_y);
+        let fix_ms = plain.first_sample_ms / 1000 * 1000;
+        let age_ms = (plain.first_sample_ms - fix_ms) as i16;
+        Packet { speed: Some(crate::protocol::SpeedFix { cm_s: speed_cm_s, age_ms }), ..plain }
+    }
+
+    #[test]
+    fn the_gps_speed_corrects_the_forward_acceleration_and_is_reported() {
+        // A steady 10 m/s while the accelerometer insists on 0.4 m/s²: after a while the dots see none of it.
+        let (live, t0) = connected();
+        for seq in 0..400u16 {
+            live.push(&packet_with_speed(seq, 400, 1000), t0);
+        }
+        let m = live.current(t0);
+        assert!(m.forward.abs() < 0.05, "{}", m.forward);
+        let gps = live.status(t0).gps.expect("the speed is in use");
+        assert!((gps.speed - 10.0).abs() < 1e-3 && (gps.bias - 0.4).abs() < 0.05, "{gps:?}");
+        let report = live.status(t0).report();
+        assert!(report.contains("GPS speed 10.0 m/s (36 km/h)"), "{report}");
+    }
+
+    #[test]
+    fn without_a_speed_in_the_packets_the_accelerometer_alone_drives_the_dots() {
+        let (live, t0) = connected();
+        for seq in 0..400u16 {
+            live.push(&packet(seq, 400), t0);
+        }
+        assert!((live.current(t0).forward - 0.4).abs() < 1e-4);
+        assert_eq!(live.status(t0).gps, None);
+        assert!(live.status(t0).report().contains("accelerometer only"));
+    }
+
+    #[test]
+    fn a_reconnect_or_relearn_forgets_the_speed() {
+        let (live, t0) = connected();
+        for seq in 0..400u16 {
+            live.push(&packet_with_speed(seq, 400, 1000), t0);
+        }
+        assert!(live.status(t0).gps.is_some());
+        live.relearn();
+        assert_eq!(live.status(t0).gps, None);
+        live.push(&packet_with_speed(400, 400, 1000), t0);
+        assert!(live.status(t0).gps.is_some());
+        live.set_link(LinkState::Scanning);
+        assert_eq!(live.status(t0).gps, None);
     }
 
     #[test]

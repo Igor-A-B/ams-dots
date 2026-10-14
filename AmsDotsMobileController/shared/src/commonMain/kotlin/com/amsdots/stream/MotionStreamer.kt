@@ -3,6 +3,8 @@ package com.amsdots.stream
 import com.amsdots.protocol.MotionPacket
 import com.amsdots.protocol.PacketCodec
 import com.amsdots.protocol.Protocol
+import com.amsdots.protocol.SpeedFix
+import kotlin.math.roundToInt
 
 /** Where encoded packets go: the BLE notification of the motion characteristic. */
 interface NotificationSink {
@@ -24,6 +26,9 @@ interface NotificationSink {
  * samples are dropped, so the laptop always sees recent motion rather than
  * a growing backlog.
  *
+ * The newest GPS speed ([onSpeed]) rides along in every packet until it is older than
+ * [Protocol.MAX_FIX_AGE_MS], after which packets say "no speed".
+ *
  * Not thread-safe: call it from a single thread.
  */
 class MotionStreamer(
@@ -35,6 +40,9 @@ class MotionStreamer(
     private var sequence = 0
     private var startNs: Long? = null
     private var inFlight = false
+
+    /** The newest GPS fix: time on the sensors' clock (ns) and speed (m/s). */
+    private var fix: Pair<Long, Double>? = null
 
     /** Largest sample count per packet for the current MTU; 0 until an MTU is known. */
     private var perPacket = 0
@@ -58,6 +66,11 @@ class MotionStreamer(
             samplesDropped++
         }
         pump()
+    }
+
+    /** A GPS fix: [speed] in m/s at [timeNs], on the same clock as the samples' times. */
+    fun onSpeed(timeNs: Long, speed: Double) {
+        if (speed.isFinite() && speed >= 0) fix = timeNs to speed
     }
 
     fun onNotificationSent() {
@@ -88,6 +101,7 @@ class MotionStreamer(
             firstSampleMs = (samples[0].timeNs - (startNs ?: samples[0].timeNs)) / 1_000_000 and 0xFFFF_FFFFL,
             gravityMg = samples.last().gravityMg,
             samples = samples.map { it.sample },
+            speed = speedFor(samples[0].timeNs),
         )
         if (sink.send(PacketCodec.encode(packet))) {
             inFlight = true
@@ -96,5 +110,13 @@ class MotionStreamer(
         } else {
             samplesDropped += count
         }
+    }
+
+    /** The fix as the packet whose first sample is at [firstSampleNs] carries it, or `null` if there is none or it is too old. */
+    private fun speedFor(firstSampleNs: Long): SpeedFix? {
+        val (fixNs, speed) = fix ?: return null
+        val ageMs = ((firstSampleNs - fixNs) / 1_000_000).coerceIn(Short.MIN_VALUE.toLong(), Short.MAX_VALUE.toLong()).toInt()
+        if (ageMs > Protocol.MAX_FIX_AGE_MS) return null
+        return SpeedFix((speed * 100).roundToInt().coerceIn(0, Protocol.MAX_SPEED_CM_S), ageMs)
     }
 }

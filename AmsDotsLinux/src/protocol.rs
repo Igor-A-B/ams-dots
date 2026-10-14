@@ -14,8 +14,13 @@ pub const MOTION_UUID: &str = "5af2dba6-9864-4524-812f-60c35dcb3ff0";
 /// Write characteristic that takes control commands.
 pub const CONTROL_UUID: &str = "95978bed-ce1d-404c-932b-25cab3db5b2e";
 
-const VERSION: u8 = 1;
-const HEADER_SIZE: usize = 13;
+/// Version 1 has no speed; version 2 (what the phone sends) adds the GPS speed and its age to the header.
+const VERSION_1: u8 = 1;
+const VERSION_2: u8 = 2;
+const HEADER_SIZE_V1: usize = 13;
+const HEADER_SIZE_V2: usize = 17;
+/// Wire value of the speed field when the phone has no GPS speed.
+const NO_SPEED: u16 = 0xFFFF;
 const SAMPLE_SIZE: usize = 12;
 const MAX_SAMPLES: usize = 4;
 
@@ -32,6 +37,22 @@ pub struct RawSample {
     pub gyro_mrad_s: [i16; 3],
 }
 
+/// The phone's newest GPS speed fix, as sent in the header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpeedFix {
+    /// Speed over ground, cm/s.
+    pub cm_s: u16,
+    /// The packet's first sample time minus the fix time, ms. Negative: the fix is newer than the first sample.
+    pub age_ms: i16,
+}
+
+impl SpeedFix {
+    /// Speed over ground, m/s.
+    pub fn speed(&self) -> f32 {
+        f32::from(self.cm_s) / 100.0
+    }
+}
+
 /// One notification from the phone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Packet {
@@ -43,6 +64,8 @@ pub struct Packet {
     pub gravity_mg: [i16; 3],
     /// 1 to 4 samples, oldest first.
     pub samples: Vec<RawSample>,
+    /// The phone's newest GPS speed; `None` without one (no GPS, a stale fix, or a version 1 packet).
+    pub speed: Option<SpeedFix>,
 }
 
 /// Why a packet was rejected; matches the `error:` names in `vectors.txt`.
@@ -73,15 +96,18 @@ fn vec3_at(bytes: &[u8], at: usize) -> [i16; 3] {
     [i16_at(bytes, at), i16_at(bytes, at + 2), i16_at(bytes, at + 4)]
 }
 
-/// Decodes one notification.
+/// Decodes one notification (version 1 or 2).
 pub fn decode(bytes: &[u8]) -> Result<Packet, PacketError> {
-    if bytes.len() < HEADER_SIZE {
+    let header_size = match bytes.first() {
+        None => return Err(PacketError::TooShort),
+        Some(&VERSION_1) => HEADER_SIZE_V1,
+        Some(&VERSION_2) => HEADER_SIZE_V2,
+        Some(_) => return Err(PacketError::BadVersion),
+    };
+    if bytes.len() < header_size {
         return Err(PacketError::TooShort);
     }
-    if bytes[0] != VERSION {
-        return Err(PacketError::BadVersion);
-    }
-    let sample_bytes = bytes.len() - HEADER_SIZE;
+    let sample_bytes = bytes.len() - header_size;
     if sample_bytes % SAMPLE_SIZE != 0 {
         return Err(PacketError::BadLength);
     }
@@ -91,15 +117,20 @@ pub fn decode(bytes: &[u8]) -> Result<Packet, PacketError> {
     }
     let samples = (0..count)
         .map(|i| {
-            let at = HEADER_SIZE + i * SAMPLE_SIZE;
+            let at = header_size + i * SAMPLE_SIZE;
             RawSample { accel_mm_s2: vec3_at(bytes, at), gyro_mrad_s: vec3_at(bytes, at + 6) }
         })
         .collect();
+    let speed = (bytes[0] == VERSION_2)
+        .then(|| (u16::from_le_bytes([bytes[13], bytes[14]]), i16_at(bytes, 15)))
+        .filter(|(cm_s, _)| *cm_s != NO_SPEED)
+        .map(|(cm_s, age_ms)| SpeedFix { cm_s, age_ms });
     Ok(Packet {
         sequence: u16::from_le_bytes([bytes[1], bytes[2]]),
         first_sample_ms: u32::from_le_bytes([bytes[3], bytes[4], bytes[5], bytes[6]]),
         gravity_mg: vec3_at(bytes, 7),
         samples,
+        speed,
     })
 }
 
@@ -160,7 +191,7 @@ mod tests {
     #[test]
     fn valid_vectors_decode_to_the_documented_values() {
         let valid: Vec<Block> = blocks().into_iter().filter(|b| b.kind == "vector").collect();
-        assert!(valid.len() >= 3);
+        assert!(valid.len() >= 7);
         for v in valid {
             let packet = decode(&bytes(v.one("hex"))).unwrap_or_else(|e| panic!("{}: {e}", v.name));
             assert_eq!(i64::from(packet.sequence), v.one("seq").parse::<i64>().unwrap(), "{}", v.name);
@@ -174,13 +205,19 @@ mod tests {
                 .map(|s| s.accel_mm_s2.iter().chain(&s.gyro_mrad_s).map(|&n| i64::from(n)).collect())
                 .collect();
             assert_eq!(actual, expected, "{}", v.name);
+            let speed = v.fields.iter().find(|(k, _)| k == "speed_cm_s").map(|(_, s)| s.as_str()).unwrap_or("none");
+            let expected_speed = (speed != "none").then(|| SpeedFix {
+                cm_s: speed.parse().unwrap(),
+                age_ms: v.one("fix_age_ms").parse().unwrap(),
+            });
+            assert_eq!(packet.speed, expected_speed, "{}", v.name);
         }
     }
 
     #[test]
     fn invalid_vectors_are_rejected_with_the_documented_error() {
         let invalid: Vec<Block> = blocks().into_iter().filter(|b| b.kind == "invalid").collect();
-        assert!(invalid.len() >= 6);
+        assert!(invalid.len() >= 9);
         for v in invalid {
             let expected = match v.one("error") {
                 "too_short" => PacketError::TooShort,
@@ -191,6 +228,11 @@ mod tests {
             };
             assert_eq!(decode(&bytes(v.one("hex"))), Err(expected), "{}", v.name);
         }
+    }
+
+    #[test]
+    fn a_speed_fix_converts_to_m_s() {
+        assert_eq!(SpeedFix { cm_s: 1389, age_ms: 0 }.speed(), 13.89);
     }
 
     #[test]

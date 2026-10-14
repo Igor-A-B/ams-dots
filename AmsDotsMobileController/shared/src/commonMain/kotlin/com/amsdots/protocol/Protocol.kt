@@ -5,11 +5,26 @@ package com.amsdots.protocol
  * `docs/protocol.md`; this file and the Rust receiver must both follow it.
  */
 object Protocol {
-    /** Version byte at the start of every motion packet. */
-    const val VERSION = 1
+    /** Version byte at the start of every motion packet the phone sends. */
+    const val VERSION = 2
 
-    /** Bytes before the first sample: version, sequence, time, gravity. */
-    const val HEADER_SIZE = 13
+    /** The first version, without the GPS speed; still decoded, never sent. */
+    const val VERSION_1 = 1
+
+    /** Bytes before the first sample: version, sequence, time, gravity, speed, speed age. */
+    const val HEADER_SIZE = 17
+
+    /** Header of a version 1 packet: no speed and age. */
+    const val HEADER_SIZE_V1 = 13
+
+    /** Wire value of the speed field when there is no GPS speed. */
+    const val NO_SPEED = 0xFFFF
+
+    /** A GPS fix older than this (ms) is not sent: the receiver falls back to the accelerometer. */
+    const val MAX_FIX_AGE_MS = 5_000
+
+    /** Largest speed on the wire (cm/s); faster saturates. */
+    const val MAX_SPEED_CM_S = 0xFFFE
 
     /** Bytes per sample: six 16-bit values. */
     const val SAMPLE_SIZE = 12

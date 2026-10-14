@@ -12,6 +12,7 @@ mod picker;
 mod protocol;
 mod replay;
 mod service;
+mod speed;
 mod spring;
 
 use cli::{Options, Parsed, USAGE};

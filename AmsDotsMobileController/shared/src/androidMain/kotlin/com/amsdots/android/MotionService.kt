@@ -242,12 +242,12 @@ class MotionService : Service(), PeripheralEvents {
         }
     }
 
-    // --- GPS speed (debug figure only; nothing is sent to the laptop) ---
+    // --- GPS speed (shown on the screen and sent to the laptop in every packet) ---
 
     private fun startLocation() {
         val manager = getSystemService(LocationManager::class.java)
         if (!RequiredPermissions.hasLocation(this) || !manager.isProviderEnabled(LocationManager.GPS_PROVIDER)) {
-            Log.i(TAG, "no location permission or GPS off: speed not shown")
+            Log.i(TAG, "no location permission or GPS off: no speed shown or sent")
             return
         }
         speeds.reset()
@@ -268,6 +268,7 @@ class MotionService : Service(), PeripheralEvents {
         if (!location.hasSpeed()) return@LocationListener
         val speed = speeds.add(location.elapsedRealtimeNanos, location.speed.toDouble(), if (location.hasAccuracy()) location.accuracy.toDouble() else null)
         ServiceState.update { it.copy(speed = speed) }
+        streamer.onSpeed(location.elapsedRealtimeNanos, location.speed.toDouble())
     }
 
     // --- status and notification ---

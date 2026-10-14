@@ -2,9 +2,11 @@ package com.amsdots.stream
 
 import com.amsdots.protocol.MotionSample
 import com.amsdots.protocol.PacketCodec
+import com.amsdots.protocol.SpeedFix
 import com.amsdots.protocol.Vec3
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 class MotionStreamerTest {
@@ -23,8 +25,8 @@ class MotionStreamerTest {
     private fun sample(tMs: Long, marker: Int = 0) =
         FusedSample(tMs * 1_000_000, MotionSample(Vec3(marker, 0, 0), Vec3(0, 0, 0)), Vec3(0, 0, 1000))
 
-    /** MTU 64 fits four samples (13 + 48 + 3). */
-    private val bigMtu = 64
+    /** MTU 68 fits four samples (17 + 48 + 3). */
+    private val bigMtu = 68
 
     @Test
     fun sendsNothingUntilAnMtuIsKnown() {
@@ -48,7 +50,7 @@ class MotionStreamerTest {
 
     @Test
     fun aSmallMtuMeansFewerSamplesPerPacket() {
-        streamer.onMtu(28) // one sample
+        streamer.onMtu(32) // one sample
         streamer.onSample(sample(0))
         assertEquals(1, PacketCodec.decode(sink.sent.single()).samples.size)
     }
@@ -111,5 +113,47 @@ class MotionStreamerTest {
         val after = PacketCodec.decode(sink.sent.last())
         assertEquals(0, after.sequence)
         assertEquals(0, after.firstSampleMs) // the clock restarts with the new subscription
+    }
+
+    @Test
+    fun theNewestGpsFixRidesAlongWithItsAge() {
+        streamer.onMtu(bigMtu)
+        streamer.onSpeed(-10_000_000, 13.89) // fix 10 ms before the first sample
+        repeat(4) { streamer.onSample(sample(it * 20L)) }
+        assertEquals(SpeedFix(1389, 10), PacketCodec.decode(sink.sent.single()).speed)
+    }
+
+    @Test
+    fun aFixNewerThanTheFirstSampleHasANegativeAge() {
+        streamer.onMtu(bigMtu)
+        repeat(3) { streamer.onSample(sample(it * 20L)) }
+        streamer.onSpeed(30_000_000, 2.5)
+        streamer.onSample(sample(60))
+        assertEquals(SpeedFix(250, -30), PacketCodec.decode(sink.sent.single()).speed)
+    }
+
+    @Test
+    fun noFixOrAnOldFixMeansNoSpeed() {
+        streamer.onMtu(bigMtu)
+        repeat(4) { streamer.onSample(sample(it * 20L)) }
+        assertNull(PacketCodec.decode(sink.sent.last()).speed, "no fix yet")
+
+        streamer.onSpeed(80_000_000, 10.0)
+        streamer.onNotificationSent()
+        repeat(4) { streamer.onSample(sample(100 + it * 20L)) }
+        assertEquals(SpeedFix(1000, 20), PacketCodec.decode(sink.sent.last()).speed)
+
+        streamer.onNotificationSent()
+        repeat(4) { streamer.onSample(sample(6_000 + it * 20L)) }
+        assertNull(PacketCodec.decode(sink.sent.last()).speed, "the fix is 5.9 s old")
+    }
+
+    @Test
+    fun aFixSurvivesTheLaptopReconnecting() {
+        streamer.onSpeed(0, 8.0)
+        streamer.reset()
+        streamer.onMtu(bigMtu)
+        repeat(4) { streamer.onSample(sample(it * 20L)) }
+        assertEquals(800, PacketCodec.decode(sink.sent.single()).speed?.centimetersPerSecond)
     }
 }

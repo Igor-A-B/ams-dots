@@ -7,6 +7,8 @@
 #   hex: <bytes>              the packet, hexadecimal, spaces ignored
 #   seq / first_sample_ms     header fields
 #   gravity_mg: x y z         header gravity
+#   speed_cm_s: n | none      version 2 header: GPS speed in cm/s; absent (version 1) or none = no speed
+#   fix_age_ms: n             version 2 with a speed: first sample time minus fix time, ms (negative = newer)
 #   sample: ax ay az gx gy gz one line per sample (mm/s^2, mrad/s)
 #
 #   invalid: <name>           a packet that must be rejected
@@ -50,7 +52,7 @@ hex: 01 01 00 0a 00 00 00 00 00 00 00 e8 03
 error: bad_count
 
 invalid: wrong_version
-hex: 02 01 00 0a 00 00 00 00 00 00 00 e8 03 01 00 02 00 03 00 04 00 05 00 06 00
+hex: 03 01 00 0a 00 00 00 00 00 00 00 e8 03 01 00 02 00 03 00 04 00 05 00 06 00
 error: bad_version
 
 invalid: partial_sample
@@ -60,3 +62,53 @@ error: bad_length
 invalid: five_samples
 hex: 01 01 00 0a 00 00 00 00 00 00 00 e8 03 01 00 02 00 03 00 04 00 05 00 06 00 01 00 02 00 03 00 04 00 05 00 06 00 01 00 02 00 03 00 04 00 05 00 06 00 01 00 02 00 03 00 04 00 05 00 06 00 01 00 02 00 03 00 04 00 05 00 06 00
 error: bad_count
+
+# ---- version 2: the header also carries the phone's GPS speed ----
+
+vector: v2_driving_fix_older_than_packet
+hex: 02 01 02 40 e2 01 00 88 ff 23 00 de 03 6d 05 f0 00 24 fa 14 00 dd ff 01 00 fe ff 03 00 cc f7 e2 ff 0f 00 fc ff 05 00 fa ff
+seq: 513
+first_sample_ms: 123456
+gravity_mg: -120 35 990
+speed_cm_s: 1389
+fix_age_ms: 240
+sample: -1500 20 -35 1 -2 3
+sample: -2100 -30 15 -4 5 -6
+
+vector: v2_driving_fix_newer_than_packet
+hex: 02 02 02 90 e2 01 00 88 ff 23 00 de 03 be 0a dd ff 24 fa 14 00 dd ff 01 00 fe ff 03 00
+seq: 514
+first_sample_ms: 123536
+gravity_mg: -120 35 990
+speed_cm_s: 2750
+fix_age_ms: -35
+sample: -1500 20 -35 1 -2 3
+
+vector: v2_no_speed
+hex: 02 07 00 28 00 00 00 00 00 00 00 e8 03 ff ff 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+seq: 7
+first_sample_ms: 40
+gravity_mg: 0 0 1000
+speed_cm_s: none
+sample: 0 0 0 0 0 0
+
+vector: v2_extreme_values
+hex: 02 ff ff ff ff ff ff 00 00 00 00 00 00 fe ff 00 80 ff 7f 00 80 ff 7f 00 80 ff 7f 00 80
+seq: 65535
+first_sample_ms: 4294967295
+gravity_mg: 0 0 0
+speed_cm_s: 65534
+fix_age_ms: -32768
+sample: 32767 -32768 32767 -32768 32767 -32768
+
+invalid: v2_header_truncated
+hex: 02 01 00 0a 00 00 00 00 00 00 00 e8 03 ff ff 00
+error: too_short
+
+invalid: v2_no_samples
+hex: 02 01 00 0a 00 00 00 00 00 00 00 e8 03 ff ff 00 00
+error: bad_count
+
+invalid: v2_partial_sample
+hex: 02 01 00 0a 00 00 00 00 00 00 00 e8 03 ff ff 00 00 01 00 02 00 03 00 04 00 05
+error: bad_length

@@ -29,18 +29,28 @@ data class MotionSample(val acceleration: Vec3, val rotation: Vec3) {
 }
 
 /**
+ * The phone's newest GPS speed fix.
+ *
+ * @property centimetersPerSecond speed over ground in cm/s, 0..[Protocol.MAX_SPEED_CM_S]
+ * @property ageMs the packet's first sample time minus the fix time, ms; negative when the fix is newer than the sample
+ */
+data class SpeedFix(val centimetersPerSecond: Int, val ageMs: Int)
+
+/**
  * One BLE notification.
  *
  * @property sequence counter that wraps at 65536; lets the receiver spot lost or reordered packets
  * @property firstSampleMs time of the first sample in ms since the sensors started (wraps at 2³²)
  * @property gravityMg gravity direction in the phone's axes, in 1/1000 of 9.81 m/s²
  * @property samples 1 to [Protocol.MAX_SAMPLES] samples, [Protocol.SAMPLE_SIZE] bytes each, in time order
+ * @property speed the newest GPS speed, or `null` when there is none (no GPS, or the fix is too old)
  */
 data class MotionPacket(
     val sequence: Int,
     val firstSampleMs: Long,
     val gravityMg: Vec3,
     val samples: List<MotionSample>,
+    val speed: SpeedFix? = null,
 )
 
 /** What is wrong with a packet that could not be decoded. */

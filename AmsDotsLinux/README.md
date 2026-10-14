@@ -18,6 +18,7 @@ Bluetooth) lives in `../AmsDotsMobileController`.
 | Receiving real phone data over Bluetooth, converted to vehicle axes | done, tried on a real phone (13 packets/s, no loss) |
 | Pick the phone from a list the first time; later runs connect to the last phone by themselves | done |
 | `phones`, `select`, `forget`: list and switch phones while the overlay runs | done |
+| GPS speed from the phone corrects the forward acceleration (accelerometer alone without it) | done (simulated drives and unit tests; not yet tried in a car) |
 | Automatic "forward" direction (learned from driving, no calibration step) | done (simulated drives; not yet tried in a car) |
 | `status`, `connect`, `disconnect` commands, link messages on stderr | done |
 | Runs as a background service: start returns the terminal; `stop`, `restart`, `reload` | done |
@@ -296,6 +297,20 @@ end is wrong for a while (e.g. the first drive was in reverse) run `relearn`.
 Limits: a car that has never accelerated, braked or turned cannot be learned
 from, and a long reverse teaches the opposite direction until it is outweighed.
 
+**GPS speed guides the forward motion.** The phone sends its GPS speed in every
+packet (the newest fix and how old it is). GPS speed is far more accurate than an
+accelerometer, but it arrives once a second and about a second late, so dots driven
+by it alone would react to braking after the braking is over. `speed.rs` therefore
+uses it as a reference: the forward acceleration is integrated into a speed
+estimate, every fix is compared with what the estimate was *at the time of the fix*,
+and the difference corrects the estimate and an acceleration bias that is taken off
+the accelerometer. The dots keep the accelerometer's timing and lose its drift (a
+tilted mount, gravity not fully removed). `status` shows `speed: GPS speed ... guides
+it` while this is active. With no GPS speed (no location permission, GPS off, a
+tunnel, a fix older than 3 s) the correction is dropped and the accelerometer alone
+drives the dots, exactly as before. Lateral acceleration and yaw always come from the
+phone's sensors. `--record` files gain `gps_speed` and `bias` columns.
+
 **Data flow.** A background thread (`ble.rs`) receives notifications, `protocol.rs`
 decodes them, `fusion.rs` converts them and `motion.rs` keeps the newest sample;
 the overlay reads it once per frame. A packet older than 0.5 s counts as gone.
@@ -328,6 +343,7 @@ after conversion to the vehicle's frame.
 | `src/replay.rs` | Reads and plays back the CSV recording. |
 | `src/protocol.rs` | Phone packet decoder (tested against `protocol/vectors.txt`) and control command. |
 | `src/fusion.rs` | Phone axes to vehicle axes, and learning which way is forward. |
+| `src/speed.rs` | Corrects the forward acceleration with the phone's GPS speed; falls back to the accelerometer without it. |
 | `src/picker.rs` | The list of phones, the remembered last phone, the start-up decision (ask or connect), matching by name. |
 | `src/ble.rs` | BlueZ receiver thread: scan, connect, subscribe, reconnect, clean disconnect on exit. |
 | `src/control.rs` | Unix socket for `status`, `phones`, `select`, `forget`, `connect`, `disconnect`, `relearn`, `move`, `speed`, `direction`, `auto`, `reload`, `stop`. Runs in every mode. |
