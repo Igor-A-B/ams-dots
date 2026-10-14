@@ -15,8 +15,9 @@
 //!    refresh rate (60 or 100 Hz); the `display.fps` setting skips the extra
 //!    ones.
 
-use crate::config::Config;
+use crate::config::{Config, Settings};
 use crate::dots::{self, Rect};
+use crate::manual::Manual;
 use crate::particles::Field;
 use crate::motion::MotionSource;
 use crate::replay::Sample;
@@ -42,6 +43,7 @@ use smithay_client_toolkit::{
     shm::{Shm, ShmHandler, slot::SlotPool},
 };
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tiny_skia::PixmapMut;
 
@@ -53,9 +55,12 @@ const NAMESPACE: &str = "ams-dots";
 const FRAME_SLACK: f32 = 0.004;
 
 /// Connects to the compositor and shows the dots until the process is killed
-/// or the compositor closes our surfaces. The dots react to `motion`: the phone,
-/// a looping recording, or nothing (a vehicle at rest).
-pub fn run(config: Config, motion: MotionSource) -> Result<(), String> {
+/// or the compositor closes our surfaces. The dots react to `motion` (the phone
+/// or a looping recording) unless `manual` is switched on, and follow `settings`
+/// when they are reloaded. `ready` runs once the compositor connection works,
+/// before the first frame: the place to open the control socket, so that a start
+/// that cannot work (no layer-shell) never looks like a running overlay.
+pub fn run(settings: Arc<Settings>, manual: Arc<Manual>, motion: MotionSource, ready: impl FnOnce()) -> Result<(), String> {
     let conn: Connection = Connection::connect_to_env().map_err(|e| e.to_string())?;
     let (globals, mut event_queue) = registry_queue_init::<App>(&conn).map_err(|e| e.to_string())?;
     let qh: QueueHandle<App> = event_queue.handle();
@@ -65,6 +70,7 @@ pub fn run(config: Config, motion: MotionSource) -> Result<(), String> {
         .map_err(|_| "the compositor does not support wlr-layer-shell (needed for an overlay)".to_string())?;
     let shm: Shm = Shm::bind(&globals, &qh).map_err(|e| e.to_string())?;
     let pool: SlotPool = SlotPool::new(1, &shm).map_err(|e| e.to_string())?;
+    let (config, config_generation) = settings.snapshot();
 
     let mut app = App {
         registry_state: RegistryState::new(&globals),
@@ -77,10 +83,14 @@ pub fn run(config: Config, motion: MotionSource) -> Result<(), String> {
         slots_pool_len: 0,
         overlays: Vec::new(),
         config,
+        config_generation,
+        settings,
+        manual,
         motion,
         started: Instant::now(),
         exit: false,
     };
+    ready();
 
     // Outputs arrive as events; `new_output` creates one overlay per monitor.
     while !app.exit {
@@ -135,7 +145,12 @@ struct App {
     slots: HashMap<usize, SlotContent>,
     slots_pool_len: usize,
     overlays: Vec<Overlay>,
+    /// The settings in use, and the [`Settings::generation`] they came from.
     config: Config,
+    config_generation: u64,
+    settings: Arc<Settings>,
+    /// Direction and speed set by hand; replaces `motion` while on.
+    manual: Arc<Manual>,
     motion: MotionSource,
     /// Replay clock origin.
     started: Instant,
@@ -174,9 +189,23 @@ impl App {
         self.overlays.iter().position(|o| o.layer.wl_surface() == surface)
     }
 
-    /// The vehicle motion right now, from whichever source is configured.
+    /// The vehicle motion right now: what was set by hand, or else whatever source is configured.
     fn current_sample(&self) -> Sample {
-        self.motion.at(self.started.elapsed().as_secs_f32())
+        let elapsed = self.started.elapsed().as_secs_f32();
+        self.manual.sample(elapsed, &self.config.motion).unwrap_or_else(|| self.motion.at(elapsed))
+    }
+
+    /// Picks up a reloaded config file: every monitor starts its dots again with the new settings.
+    fn refresh_config(&mut self) {
+        if self.settings.generation() == self.config_generation {
+            return;
+        }
+        (self.config, self.config_generation) = self.settings.snapshot();
+        for index in 0..self.overlays.len() {
+            if let Some((width, height)) = self.overlays[index].size {
+                self.start_sim(index, width, height);
+            }
+        }
     }
 
     /// (Re)creates the animation state for overlay `index` at the given size.
@@ -205,6 +234,7 @@ impl App {
     /// Advances the animation of overlay `index` by the time since its last
     /// draw, paints it and presents the result.
     fn draw(&mut self, qh: &QueueHandle<App>, index: usize) {
+        self.refresh_config();
         let sample: Sample = self.current_sample();
         let motion_cfg = self.config.motion.clone();
 

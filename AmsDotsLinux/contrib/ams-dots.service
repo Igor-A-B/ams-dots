@@ -1,0 +1,27 @@
+# systemd user unit for the AmsDots overlay.
+#
+#   mkdir -p ~/.config/systemd/user && cp contrib/ams-dots.service ~/.config/systemd/user/
+#   systemctl --user enable --now ams-dots
+#
+# Assumes `cargo install --path . --root ~/.local` (binary in ~/.local/bin). The overlay needs the
+# session's WAYLAND_DISPLAY, so the compositor must import it into systemd, e.g. in Hyprland:
+#   exec-once = dbus-update-activation-environment --systemd WAYLAND_DISPLAY XDG_CURRENT_DESKTOP
+#
+# The unit runs the overlay in the foreground (systemd is the one that puts it in the background); the
+# control commands (`ams-dots-linux move`, `status`, ...) work the same. Messages go to
+# `journalctl --user -u ams-dots`. Stop it with `systemctl --user stop ams-dots`; `ams-dots-linux stop`
+# also works (it exits cleanly, so the unit is not restarted).
+
+[Unit]
+Description=AmsDots vehicle motion cue overlay
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/ams-dots-linux --foreground
+# A crash restarts it; a clean exit (`ams-dots-linux stop`) does not.
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

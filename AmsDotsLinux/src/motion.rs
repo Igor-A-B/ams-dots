@@ -1,6 +1,6 @@
-//! Where the dots get their motion from: nothing (vehicle at rest), a CSV
-//! recording, or the phone over Bluetooth. The overlay asks one question per
-//! frame, [`MotionSource::at`], and does not care which it is.
+//! Where the dots get their motion from: a CSV recording or the phone over
+//! Bluetooth (no phone connected means a vehicle at rest). The overlay asks one
+//! question per frame, [`MotionSource::at`], and does not care which it is.
 //!
 //! [`Live`] is also the meeting point of the Bluetooth thread, the fusion and
 //! the `status` / `connect` / `disconnect` / `phones` / `select` commands: it
@@ -28,11 +28,9 @@ pub const SIGHTING_MAX_AGE: Duration = Duration::from_secs(30);
 const DEFAULT_SAMPLE_DT: f32 = 0.02;
 
 pub enum MotionSource {
-    /// Vehicle at rest.
-    Rest,
     /// A recording, looped.
     Replay(Vec<Sample>),
-    /// The phone, via the Bluetooth receiver thread.
+    /// The phone, via the Bluetooth receiver thread. Zero motion while no phone is connected.
     Live(Arc<Live>),
 }
 
@@ -40,7 +38,6 @@ impl MotionSource {
     /// Motion `elapsed` seconds after the overlay started.
     pub fn at(&self, elapsed: f32) -> Sample {
         match self {
-            MotionSource::Rest => Sample { t: elapsed, forward: 0.0, lateral: 0.0, yaw: 0.0 },
             MotionSource::Replay(samples) => replay::at(samples, elapsed),
             MotionSource::Live(live) => {
                 let m = live.current(Instant::now());
@@ -491,8 +488,8 @@ mod tests {
     }
 
     #[test]
-    fn rest_and_replay_sources_answer_per_frame() {
-        assert_eq!(MotionSource::Rest.at(1.0).forward, 0.0);
+    fn phone_and_replay_sources_answer_per_frame() {
+        assert_eq!(MotionSource::Live(Live::new()).at(1.0).forward, 0.0, "no phone, no motion");
         let samples = replay::parse("t,f,l,y\n0,0,0,0\n1,2,0,0\n").unwrap();
         assert_eq!(MotionSource::Replay(samples).at(0.5).forward, 1.0);
     }

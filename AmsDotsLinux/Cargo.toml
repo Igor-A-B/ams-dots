@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 bluer = { version = "0.17.4", features = ["bluetoothd"] }
 futures = "0.3.34"
+libc = "0.2"
 serde = { version = "1.0.229", features = ["derive"] }
 signal-hook = "0.4.5"
 smithay-client-toolkit = "0.21.1"

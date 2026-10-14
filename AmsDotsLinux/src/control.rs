@@ -13,11 +13,24 @@
 //! | `connect` | (re)start looking for the phone |
 //! | `disconnect` | drop the phone and stop looking until `connect` |
 //! | `relearn` | forget the learned forward direction, e.g. after moving the phone |
+//! | `move DIR [SPEED]` | manual control: dots flow towards `DIR` at `SPEED` % of the maximum (see `manual.rs`) |
+//! | `speed N\|+N\|-N` | change the manual speed (switches manual control on) |
+//! | `direction D\|+D\|-D` | change the manual direction (switches manual control on) |
+//! | `auto` | the phone (or recording) drives the dots again |
+//! | `reload` | read the config file again and apply it |
+//! | `stop` | end the overlay |
 //!
-//! Example key binding for Hyprland: `bind = $mod, F9, exec, ams-dots-linux disconnect`.
+//! The server runs whatever the motion source is (phone, recording, nothing), because manual control,
+//! `reload` and `stop` do not need Bluetooth.
+//!
+//! Example key bindings for Hyprland: `bind = $mod, F9, exec, ams-dots-linux disconnect`,
+//! `bind = $mod, equal, exec, ams-dots-linux speed +10`.
 
+use crate::config::Settings;
+use crate::manual::{self, Manual};
 use crate::motion::Live;
 use crate::picker::{self, Candidate, FileMemory, PhoneMemory, Target};
+use crate::service;
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,18 +47,39 @@ pub fn socket_path() -> PathBuf {
     dir.join("ams-dots.sock")
 }
 
+/// What the commands act on.
+pub struct Context {
+    pub live: Arc<Live>,
+    pub manual: Arc<Manual>,
+    pub settings: Arc<Settings>,
+    /// False while replaying a recording: there is no Bluetooth receiver then, so the phone cannot be (dis)connected.
+    pub phone: bool,
+}
+
+const NO_PHONE: &str = "error: a recording is being replayed, so there is no phone link; run `ams-dots-linux restart` without the recording to use the phone";
+
 /// What to answer one (non-streaming) command line. Kept separate from the socket so it can be tested.
-pub fn handle_command(live: &Live, memory: &dyn PhoneMemory, line: &str) -> String {
+pub fn handle_command(ctx: &Context, memory: &dyn PhoneMemory, line: &str) -> String {
+    let live = &*ctx.live;
     let line = line.trim();
     let (command, argument) = line.split_once(char::is_whitespace).map_or((line, ""), |(c, a)| (c, a.trim()));
     match command {
         "status" => {
             let remembered = memory.get();
             let report = live.status(Instant::now()).report();
-            format!("{report}\nlast phone: {}", remembered.as_deref().unwrap_or("-"))
+            format!("{report}\nlast phone: {}\ndots:     {}", remembered.as_deref().unwrap_or("-"), dots_source(ctx))
         }
+        "move" => manual_move(ctx, argument),
+        "speed" => manual_one(ctx, argument, "speed"),
+        "direction" => manual_one(ctx, argument, "direction"),
+        "auto" => auto(ctx),
+        "reload" => match ctx.settings.reload() {
+            Ok(()) => format!("ok: applied {}", ctx.settings.source()),
+            Err(err) => format!("error: {err} (the running settings are unchanged)"),
+        },
         "phones" if argument == "--raw" => picker::to_lines(&live.phones(Instant::now())),
         "phones" => phones_report(live, memory),
+        "select" | "connect" if !ctx.phone => NO_PHONE.to_string(),
         "select" => select(live, memory, argument),
         "forget" => {
             memory.forget();
@@ -64,9 +98,64 @@ pub fn handle_command(live: &Live, memory: &dyn PhoneMemory, line: &str) -> Stri
             "ok: forgot the forward direction; it is learned again from the next drive".to_string()
         }
         other => format!(
-            "error: unknown command {other:?} (known: status, status --watch, phones, select, forget, connect, disconnect, relearn)"
+            "error: unknown command {other:?} (known: status, status --watch, phones, select, forget, connect, disconnect, relearn, move, speed, direction, auto, reload, stop)"
         ),
     }
+}
+
+/// What drives the dots right now, for `status`.
+fn dots_source(ctx: &Context) -> String {
+    match ctx.manual.current() {
+        Some(setting) => format!(
+            "moved by hand: {} (phone ignored; `ams-dots-linux auto` gives control back)",
+            setting.describe(&ctx.settings.config().motion)
+        ),
+        None if ctx.phone && ctx.live.is_connected() => "follow the phone".to_string(),
+        None if ctx.phone => "at rest (no phone connected; `ams-dots-linux move` sets them by hand)".to_string(),
+        None => "replaying a recording".to_string(),
+    }
+}
+
+/// The reply to a command that changed the manual setting.
+fn manual_reply(ctx: &Context, setting: manual::Setting) -> String {
+    format!("ok: dots flow {}; `ams-dots-linux auto` gives control back", setting.describe(&ctx.settings.config().motion))
+}
+
+/// `move DIR [SPEED]`.
+fn manual_move(ctx: &Context, argument: &str) -> String {
+    let mut words = argument.split_whitespace();
+    let (Some(direction), speed, None) = (words.next(), words.next(), words.next()) else {
+        return "error: usage: move DIRECTION [SPEED]   e.g. `move down 60`, `move up-left`, `move 45 30`".to_string();
+    };
+    let parsed = manual::parse_direction(direction).and_then(|d| speed.map(manual::parse_speed).transpose().map(|s| (d, s)));
+    match parsed {
+        Ok((direction, speed)) => manual_reply(ctx, ctx.manual.set(Some(direction), speed)),
+        Err(err) => format!("error: {err}"),
+    }
+}
+
+/// `speed N` and `direction D`.
+fn manual_one(ctx: &Context, argument: &str, what: &str) -> String {
+    if argument.is_empty() {
+        return match what {
+            "speed" => "error: usage: speed PERCENT   e.g. `speed 70`, `speed +10`, `speed 0`".to_string(),
+            _ => "error: usage: direction DIRECTION   e.g. `direction left`, `direction 135`, `direction +15` (turns clockwise)".to_string(),
+        };
+    }
+    let setting = match what {
+        "speed" => manual::parse_speed(argument).map(|s| ctx.manual.set(None, Some(s))),
+        _ => manual::parse_direction(argument).map(|d| ctx.manual.set(Some(d), None)),
+    };
+    match setting {
+        Ok(setting) => manual_reply(ctx, setting),
+        Err(err) => format!("error: {err}"),
+    }
+}
+
+fn auto(ctx: &Context) -> String {
+    let was_manual = ctx.manual.clear();
+    let now = if ctx.phone { "follow the phone" } else { "replay the recording" };
+    if was_manual { format!("ok: the dots {now} again") } else { format!("ok: already automatic (the dots {now})") }
 }
 
 /// The numbered list `phones` prints and `select N` counts in.
@@ -119,11 +208,29 @@ fn select(live: &Live, memory: &dyn PhoneMemory, argument: &str) -> String {
     format!("ok: following {}", target.describe())
 }
 
+/// Runs the command server on a thread of its own, so that it works whether or not there is a Bluetooth receiver
+/// and keeps answering whatever the receiver is doing.
+pub fn spawn(ctx: Arc<Context>) {
+    std::thread::Builder::new()
+        .name("ams-dots-control".into())
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("async runtime");
+            runtime.block_on(serve(ctx));
+        })
+        .expect("spawn the control thread");
+}
+
+/// Whether an overlay is already answering on the control socket (a socket file left by a crash does not count).
+pub fn is_running() -> bool {
+    std::os::unix::net::UnixStream::connect(socket_path()).is_ok()
+}
+
 /// Accepts commands until the process ends. A socket that cannot be opened is
 /// reported and the overlay carries on without remote commands.
-pub async fn serve(live: Arc<Live>) {
+async fn serve(ctx: Arc<Context>) {
     let path = socket_path();
-    // A socket file left behind by a crashed run would make `bind` fail.
+    // A socket file left behind by a crashed run would make `bind` fail. (That no other overlay is
+    // still using it was checked at start-up, see `is_running`.)
     let _ = std::fs::remove_file(&path);
     let listener = match UnixListener::bind(&path) {
         Ok(listener) => listener,
@@ -134,7 +241,7 @@ pub async fn serve(live: Arc<Live>) {
     };
     loop {
         let Ok((stream, _)) = listener.accept().await else { continue };
-        let live = live.clone();
+        let ctx = ctx.clone();
         let memory = FileMemory::default_location();
         tokio::spawn(async move {
             let (read, mut write) = stream.into_split();
@@ -142,18 +249,27 @@ pub async fn serve(live: Arc<Live>) {
             if AsyncBufReader::new(read).read_line(&mut line).await.is_err() {
                 return;
             }
-            if line.trim() == "watch" {
-                // Stream until the client goes away (the write then fails).
-                loop {
-                    let text = live.status(Instant::now()).line();
-                    if write.write_all(format!("{text}\n").as_bytes()).await.is_err() {
-                        break;
+            match line.trim() {
+                // A bare connection (`is_running`) says nothing.
+                "" => {}
+                "watch" => {
+                    // Stream until the client goes away (the write then fails).
+                    loop {
+                        let text = ctx.live.status(Instant::now()).line();
+                        if write.write_all(format!("{text}\n").as_bytes()).await.is_err() {
+                            break;
+                        }
+                        tokio::time::sleep(WATCH_INTERVAL).await;
                     }
-                    tokio::time::sleep(WATCH_INTERVAL).await;
                 }
-            } else {
-                let reply = handle_command(&live, &memory, &line);
-                let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
+                "stop" => {
+                    let _ = write.write_all(b"ok: stopping\n").await;
+                    service::shutdown(&ctx.live, 0);
+                }
+                _ => {
+                    let reply = handle_command(&ctx, &memory, &line);
+                    let _ = write.write_all(format!("{reply}\n").as_bytes()).await;
+                }
             }
         });
     }
@@ -162,7 +278,7 @@ pub async fn serve(live: Arc<Live>) {
 fn connect_to_overlay() -> Result<std::os::unix::net::UnixStream, String> {
     let path = socket_path();
     std::os::unix::net::UnixStream::connect(&path)
-        .map_err(|e| format!("cannot reach the overlay at {} ({e}); is it running?", path.display()))
+        .map_err(|e| format!("not running (nothing answers at {}: {e}); start it with `ams-dots-linux`", path.display()))
 }
 
 /// Client side of a command: returns the overlay's answer (`status` takes several lines).
@@ -238,8 +354,17 @@ mod tests {
         live
     }
 
-    fn run(live: &Live, memory: &Memory, line: &str) -> String {
-        handle_command(live, memory, line)
+    fn context(live: &Arc<Live>) -> Context {
+        let settings = Settings::load(Some(std::env::var("CARGO_MANIFEST_DIR").unwrap() + "/config.example.toml")).unwrap();
+        Context { live: live.clone(), manual: Manual::new(), settings, phone: true }
+    }
+
+    fn run(live: &Arc<Live>, memory: &Memory, line: &str) -> String {
+        handle_command(&context(live), memory, line)
+    }
+
+    fn ask(ctx: &Context, line: &str) -> String {
+        handle_command(ctx, &Memory::default(), line)
     }
 
     #[test]
@@ -353,6 +478,81 @@ mod tests {
     #[test]
     fn relearn_is_accepted() {
         assert!(run(&Live::new(), &Memory::default(), "relearn").starts_with("ok"));
+    }
+
+    #[test]
+    fn move_switches_manual_control_on_and_auto_off() {
+        let ctx = context(&Live::new());
+        assert_eq!(ctx.manual.current(), None);
+        let reply = ask(&ctx, "move left 80");
+        assert!(reply.starts_with("ok: dots flow left at 80% (200 px/s)"), "{reply}");
+        assert_eq!(ctx.manual.current(), Some(manual::Setting { direction: 270.0, speed: 80.0 }));
+        assert!(ask(&ctx, "auto").starts_with("ok: the dots follow the phone again"));
+        assert_eq!(ctx.manual.current(), None);
+        assert!(ask(&ctx, "auto").contains("already automatic"));
+    }
+
+    #[test]
+    fn move_without_a_speed_keeps_the_current_one() {
+        let ctx = context(&Live::new());
+        ask(&ctx, "move up 30");
+        ask(&ctx, "move right");
+        assert_eq!(ctx.manual.current(), Some(manual::Setting { direction: 90.0, speed: 30.0 }));
+    }
+
+    #[test]
+    fn speed_and_direction_change_one_thing_at_a_time() {
+        let ctx = context(&Live::new());
+        ask(&ctx, "move down 50");
+        assert!(ask(&ctx, "speed +10").starts_with("ok"));
+        assert!(ask(&ctx, "direction +90").starts_with("ok"));
+        assert_eq!(ctx.manual.current(), Some(manual::Setting { direction: 270.0, speed: 60.0 }));
+        ask(&ctx, "speed 0");
+        assert_eq!(ctx.manual.current().map(|s| s.speed), Some(0.0), "speed 0 is manual and still, not automatic");
+    }
+
+    #[test]
+    fn manual_commands_refuse_nonsense_and_change_nothing() {
+        let ctx = context(&Live::new());
+        for line in ["move", "move sideways", "move down fast", "move down 50 extra", "speed", "speed fast", "direction", "direction nowhere"] {
+            assert!(ask(&ctx, line).starts_with("error"), "{line}");
+        }
+        assert_eq!(ctx.manual.current(), None);
+    }
+
+    #[test]
+    fn status_says_who_drives_the_dots() {
+        let ctx = context(&Live::new());
+        assert!(ask(&ctx, "status").contains("dots:     at rest (no phone connected"));
+        ctx.live.set_link(crate::motion::LinkState::Connected);
+        assert!(ask(&ctx, "status").contains("dots:     follow the phone"));
+        ask(&ctx, "move down-right 100");
+        let status = ask(&ctx, "status");
+        assert!(status.contains("moved by hand: down-right at 100% (250 px/s)"), "{status}");
+    }
+
+    #[test]
+    fn reload_reports_a_refused_file_and_keeps_running() {
+        let path = std::env::temp_dir().join(format!("ams-dots-control-test-{}.toml", std::process::id()));
+        std::fs::write(&path, "[dots]\nsize = 9.0\n").unwrap();
+        let settings = Settings::load(Some(path.display().to_string())).unwrap();
+        let ctx = Context { settings, ..context(&Live::new()) };
+        assert!(ask(&ctx, "reload").starts_with("ok: applied"));
+
+        std::fs::write(&path, "[dots]\nsize = 0.0\n").unwrap();
+        let reply = ask(&ctx, "reload");
+        assert!(reply.starts_with("error") && reply.contains("dots.size") && reply.contains("unchanged"), "{reply}");
+        assert_eq!(ctx.settings.config().dots.size, 9.0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn replaying_a_recording_has_no_phone_to_connect() {
+        let ctx = Context { phone: false, ..context(&Live::new()) };
+        assert!(ask(&ctx, "connect").starts_with("error"));
+        assert!(ask(&ctx, "select any").starts_with("error"));
+        assert!(ask(&ctx, "status").contains("replaying a recording"));
+        assert!(ask(&ctx, "move up").starts_with("ok"), "manual control works with a recording too");
     }
 
     #[test]
